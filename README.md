@@ -15,6 +15,9 @@ Technically to do this, we hack into the samplers and sampling processing, do so
 
 to get image latents with higher quality (~perhaps!), and just pray again for good results 🤣
 
+⚠ 我们成立了插件反馈 QQ 群: 616795645 (赤狐屿)，欢迎出建议、意见、报告bug等 (w  
+⚠ We have a QQ chat group now: 616795645, any suggeustions, discussions and bug reports are highly wellllcome !!  
+
 
 ### Change Log
 
