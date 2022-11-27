@@ -11,7 +11,7 @@ Technically to do this, we hack into the samplers and sampling processing, do so
 
   - momentum on latent difference
   - sample-wise optimzaton on prompt condition and image latent
-  - txt2img under hard guidance of another given image (yet another img2img way...)
+  - txt2img under hard guidance of another given image (yet another img2img-like in a **shallow fusion** manner...)
 
 to get image latents with higher quality (~perhaps!), and just pray again for good results 🤣
 
@@ -24,6 +24,25 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 - 2022/11/27: add momentum on `Euler`, add hard ref-image guidance on `Naive`
 - 2022/11/20: add an Euler-like `Naive`, the simplest difference-estimation-based sampler with momentum & gradient
 - 2022/11/18: add momentum on `Euler a`
+
+
+⚪ momentum
+
+![momentum.png](img/momentum.png)
+
+⚪ grad on condition
+
+![grad_c.png](img/grad_c.png)
+
+⚪ grad on latent
+
+![grad_x.png](img/grad_x.png)
+
+⚪ ref_img guide
+
+![ref.png](img/ref.png)
+
+⚠ Above images are not intented to show the best results, but showing the trendency. You shall carefully tune these hparams all by yourself to get good results. 🤣
 
 
 ### Options
