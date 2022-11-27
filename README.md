@@ -1,6 +1,6 @@
 # stable-diffusion-webui-sonar
 
-    Tricks to improve the generated image quality, extension script for AUTOMATIC1111/stable-diffusion-webui
+    Wrapped k-diffuison samplers with tricks to improve the generated image quality, extension script for AUTOMATIC1111/stable-diffusion-webui
 
 ----
 
@@ -11,19 +11,25 @@ Technically to do this, we hack into the samplers and sampling processing, do so
 
   - momentum on latent difference
   - sample-wise optimzaton on prompt condition and image latent
+  - txt2img under hard guidance of another given image (yet another img2img way...)
 
 to get image latents with higher quality (~perhaps!), and just pray again for good results 🤣
 
 
 ### Change Log
 
-- 2022/11/18: add momentum mechanism
+- 2022/11/27: add momentum on `Euler`, add hard ref-image guidance on `Naive`
+- 2022/11/20: add an Euler-like `Naive`, the simplest difference-estimation-based sampler with momentum & gradient
+- 2022/11/18: add momentum on `Euler a`
 
 
 ### Options
 
 - prompt: (string)
-- sampler: (categorical)
+- base_sampler: (categorical)
+  - `Eular a`: `Eular` with ancestral noise sampling
+  - `Eular`: `Eular` the original
+  - `Naive`: a so simple, sometimes naive sampler but to start anything from
 - momentum_*
   - momentum: (float), momentum of current latent difference
     - the larger, approving the current difference, (set `1.0` to **disable** momentum mechanism)
@@ -39,12 +45,35 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
     - `pos`: correct by direction of history momentum, affirming the history
     - `neg`: correct by opposite direction of history momentum, denying the history
     - `rand`: random choose from above at each sampling step
-    - `pos_neg`: `pos` for the first half steps, then `neg` till the end
-    - `neg_pos`: `neg` for the first half steps, then `pos` till the end
     - NOTE: option `neg` and `pos_neg` works well only if `momentum_hist` is enough large (`~0.9`)
 - grad_*
-  - grad_w_latent
-  - grad_w_cond
+  - grad_w_cond: (float), loss weight for optimizing prompt condition
+  - grad_c_iter: (int), optimizing step count **per sampling step** for condition
+  - grad_c_alpha: (float), optimizing step size for condition
+  - grad_c_skip: (int), skip cond optimizing for the first n-steps
+  - grad_w_latent: (float), loss weight for optimizing image latent
+  - grad_x_iter: (int), optimizing step count for latent (this is NOT per sampling step)
+  - grad_x_alpha: (float), optimizing step size for latent
+  - grad_fuzzy: (bool), use fuzzy gradient for both
+- ref_*
+  - ref_img: (file), reference image file
+  - ref_meth: (categorical)
+    - `linear`: linear interpolate between current and ref latent
+    - `euler`: make an eular step from current to ref latent 
+  - ref_start_step: (float)
+  - ref_stop_step: (float)
+    - sampling step range which enables the ref guidance mechanism (kind of scheduling)
+    - if > 1, parse as step number; if <= 1, parse as percentage of total steps
+
+
+### Developers
+
+This repo allows your to quickly implement your own k-diffusion samplers, follow to do this:
+
+- creart a sampling procedure `sample_<name>()`, you can refer to the skeleton sampler `sample_naive()`
+- add a `SamplerData` entry in `all_samplers_sonar`
+- design ui components for your sampler hparams in `ui()`, then modify `swith_sampler()` to show/hide related tabs
+- restart webui and play with your own sampler~
 
 
 ### Installation
@@ -57,7 +86,6 @@ Easiest way to install it is to:
 Manual install:
 1. Copy this repo folder to the 'extensions' folder of https://github.com/AUTOMATIC1111/stable-diffusion-webui
 2. Go to the "Settings" tab, click "Restart Gradio and Refresh components" button
-
 
 ----
 

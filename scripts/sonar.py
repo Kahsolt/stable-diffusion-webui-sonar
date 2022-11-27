@@ -1,40 +1,72 @@
 import os
-from copy import deepcopy
 from PIL import Image
-from typing import List, Tuple, Union
+from typing import List
+from pprint import pprint as pp
 
 import gradio as gr
 import torch
-import torch.nn.functional as F
 import numpy as np
+from tqdm.auto import trange
 
 import modules.scripts as scripts
 from modules.shared import state
+from modules.processing import *
+from modules.sd_samplers import *
+from modules.prompt_parser import ScheduledPromptConditioning, MulticondLearnedConditioning
+from k_diffusion.sampling import to_d, get_ancestral_step
+from ldm.models.diffusion.ddpm import LatentDiffusion
 
-DEFAULT_SAMPLER            = 'Euler a mg'
+DEFAULT_SAMPLER            = 'Euler a'
 DEFAULT_MOMENTUM           = 0.95
 DEFAULT_MOMENTUM_HIST      = 0.75
 DEFAULT_MOMENTUM_HIST_INIT = 'zero'
 DEFAULT_MOMENTUM_SIGN      = 'pos'
-DEFAULT_DEBUG              = True
+DEFAULT_GRAD_C_ITER        = 0
+DEFAULT_GRAD_C_ALPHA       = -0.002
+DEFAULT_GRAD_C_SKIP        = 5
+DEFAULT_GRAD_X_ITER        = 0
+DEFAULT_GRAD_X_ALPHA       = -0.02
+DEFAULT_GRAD_FUZZY         = False
+DEFAULT_REF_METH           = 'linear'
+DEFAULT_REF_HGF            = 0.02
+DEFAULT_REF_MIN_STEP       = 0.0
+DEFAULT_REF_MAX_STEP       = 0.5
+DEFAULT_REF_IMG            = None
 
-CHOICE_MOMENTUM_SIGN      = ['pos', 'neg', 'pos_neg', 'neg_pos', 'rand']
+CHOICE_MOMENTUM_SIGN      = ['pos', 'neg', 'rand']
 CHOICE_MOMENTUM_HIST_INIT = ['zero', 'rand_init', 'rand_new']
+CHOICE_REF_METH           = ['linear', 'euler']
+
+# debug save latent featmap (when `euler a`)
+#FEAT_MAP_PATH = 'C:\sd-webui_featmaps'
+FEAT_MAP_PATH = None
 
 # the current setting (the wrappers are too deep, we pass it by global var)
 settings = {
     'sampler':            DEFAULT_SAMPLER,
+
     'momentum':           DEFAULT_MOMENTUM,
     'momentum_hist':      DEFAULT_MOMENTUM_HIST,
     'momentum_hist_init': DEFAULT_MOMENTUM_HIST_INIT,
     'momentum_sign':      DEFAULT_MOMENTUM_SIGN,
+
+    'grad_c_iter':        DEFAULT_GRAD_C_ITER,
+    'grad_c_alpha':       DEFAULT_GRAD_C_ALPHA,
+    'grad_c_skip':        DEFAULT_GRAD_C_SKIP,
+    'grad_x_iter':        DEFAULT_GRAD_X_ITER,
+    'grad_x_alpha':       DEFAULT_GRAD_X_ALPHA,
+    'grad_fuzzy':         DEFAULT_GRAD_FUZZY,
+
+    'ref_meth':           DEFAULT_REF_METH,
+    'ref_hgf':            DEFAULT_REF_HGF,
+    'ref_min_step':       DEFAULT_REF_MIN_STEP,
+    'ref_max_step':       DEFAULT_REF_MAX_STEP,
+    'ref_img':            DEFAULT_REF_IMG,
 }
 
 Tensor = torch.Tensor
 
 # ↓↓↓ the following is modified from 'modules/processing.py' ↓↓↓
-
-from modules.processing import *
 
 def process_images(p: StableDiffusionProcessing) -> Processed:
     stored_opts = {k: opts.data[k] for k in p.override_settings.keys()}
@@ -59,26 +91,25 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     else:
         assert p.prompt is not None
 
-    with open(os.path.join(shared.script_path, "params.txt"), "w", encoding="utf8") as file:
-        processed = Processed(p, [], p.seed, "")
-        file.write(processed.infotext(p, 0))
-
     devices.torch_gc()
 
     seed = get_fixed_seed(p.seed)
     subseed = get_fixed_seed(p.subseed)
 
-    model_hijack.apply_circular(p.tiling)
-    model_hijack.clear_comments()
+    modules.sd_hijack.model_hijack.apply_circular(p.tiling)
+    modules.sd_hijack.model_hijack.clear_comments()
 
     comments = {}
 
-    shared.prompt_styles.apply_styles(p)
-
     if type(p.prompt) == list:
-        p.all_prompts = p.prompt
+        p.all_prompts = [shared.prompt_styles.apply_styles_to_prompt(x, p.styles) for x in p.prompt]
     else:
-        p.all_prompts = p.batch_size * p.n_iter * [p.prompt]
+        p.all_prompts = p.batch_size * p.n_iter * [shared.prompt_styles.apply_styles_to_prompt(p.prompt, p.styles)]
+
+    if type(p.negative_prompt) == list:
+        p.all_negative_prompts = [shared.prompt_styles.apply_negative_styles_to_prompt(x, p.styles) for x in p.negative_prompt]
+    else:
+        p.all_negative_prompts = p.batch_size * p.n_iter * [shared.prompt_styles.apply_negative_styles_to_prompt(p.negative_prompt, p.styles)]
 
     if type(seed) == list:
         p.all_seeds = seed
@@ -92,6 +123,10 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
     def infotext(iteration=0, position_in_batch=0):
         return create_infotext(p, p.all_prompts, p.all_seeds, p.all_subseeds, comments, iteration, position_in_batch)
+
+    with open(os.path.join(shared.script_path, "params.txt"), "w", encoding="utf8") as file:
+        processed = Processed(p, [], p.seed, "")
+        file.write(processed.infotext(p, 0))
 
     if os.path.exists(cmd_opts.embeddings_dir) and not p.do_not_reload_embeddings:
         model_hijack.embedding_db.load_textual_inversion_embeddings()
@@ -117,6 +152,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 break
 
             prompts = p.all_prompts[n * p.batch_size:(n + 1) * p.batch_size]
+            negative_prompts = p.all_negative_prompts[n * p.batch_size:(n + 1) * p.batch_size]
             seeds = p.all_seeds[n * p.batch_size:(n + 1) * p.batch_size]
             subseeds = p.all_subseeds[n * p.batch_size:(n + 1) * p.batch_size]
 
@@ -127,7 +163,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 p.scripts.process_batch(p, batch_number=n, prompts=prompts, seeds=seeds, subseeds=subseeds)
 
             with devices.autocast():
-                uc = prompt_parser.get_learned_conditioning(shared.sd_model, len(prompts) * [p.negative_prompt], p.steps)
+                uc = prompt_parser.get_learned_conditioning(shared.sd_model, negative_prompts, p.steps)
                 c = prompt_parser.get_multicond_learned_conditioning(shared.sd_model, prompts, p.steps)
 
             if len(model_hijack.comments) > 0:
@@ -138,7 +174,6 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 shared.state.job = f"Batch {n+1} out of {p.n_iter}"
 
             with devices.autocast():
-                #samples_ddim = p.sample(conditioning=c, unconditional_conditioning=uc, seeds=seeds, subseeds=subseeds, subseed_strength=p.subseed_strength, prompts=prompts)
                 if   isinstance(p, StableDiffusionProcessingTxt2Img): sample_func = StableDiffusionProcessingTxt2Img_sample
                 elif isinstance(p, StableDiffusionProcessingImg2Img): sample_func = StableDiffusionProcessingImg2Img_sample
                 else: raise ValueError
@@ -217,7 +252,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
     devices.torch_gc()
 
-    res = Processed(p, output_images, p.all_seeds[0], infotext() + "".join(["\n\n" + x for x in comments]), subseed=p.all_subseeds[0], all_prompts=p.all_prompts, all_seeds=p.all_seeds, all_subseeds=p.all_subseeds, index_of_first_image=index_of_first_image, infotexts=infotexts)
+    res = Processed(p, output_images, p.all_seeds[0], infotext() + "".join(["\n\n" + x for x in comments]), subseed=p.all_subseeds[0], index_of_first_image=index_of_first_image, infotexts=infotexts)
 
     if p.scripts is not None:
         p.scripts.postprocess(p, res)
@@ -318,162 +353,274 @@ def StableDiffusionProcessingImg2Img_sample(self:StableDiffusionProcessingImg2Im
 # ↑↑↑ the above is modified from 'modules/processing.py' ↑↑↑
 
 
-# ↓↓↓ the following is modified from 'modules/sd_samplers.py' ↓↓↓
-
-from modules.sd_samplers import *
-from modules.prompt_parser import ScheduledPromptConditioning, MulticondLearnedConditioning
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.models.diffusion.plms import PLMSSampler
-
-all_samplers_mg = [
-    SamplerData('Euler a mg', lambda model: KDiffusionSamplerHijack('sample_euler_ancestral', model, sample_euler_ancestral_momentum_grad), ['k_euler_a_mg'], {}),
-    SamplerData('Euler mg',   lambda model: KDiffusionSamplerHijack('sample_euler',           model, sample_euler_momentum_grad),           ['k_euler_mg'],   {}),
-    SamplerData('DDIM mg',    lambda model: VanillaStableDiffusionSampler(DDIMSamplerHijack, model), ['ddim_mg'], {}),
-    SamplerData('PLMS mg',    lambda model: VanillaStableDiffusionSampler(PLMSSamplerHijack, model), ['plms_mg'], {}),
-]
-CHOICE_SAMPLER = [s.name for s in all_samplers_mg]
-
-def create_sampler(sd_model):
-    for config in all_samplers_mg:
-        if config.name == settings['sampler']:
-            sampler = config.constructor(sd_model)
-            sampler.config = config
-            return sampler
-
-    raise ValueError(f'implementaion of sampler {settings["sampler"]!r} not found')
-
-class KDiffusionSamplerHijack(KDiffusionSampler):
-
-    def __init__(self, base_funcname, sd_model, real_func):
-        # init the homogenus base sampler
-        super().__init__(base_funcname, sd_model)
-        # hijack the sampler object
-        self.func = real_func
-
-    def get_sigmas(self, p:StableDiffusionProcessing, steps:int) -> List[float]:
-        if p.sampler_noise_scheduler_override:
-            sigmas = p.sampler_noise_scheduler_override(steps)
-        elif self.config is not None and self.config.options.get('scheduler', None) == 'karras':
-            sigmas = k_diffusion.sampling.get_sigmas_karras(n=steps, sigma_min=0.1, sigma_max=10, device=shared.device)
-        else:
-            # self.model_wrap: k_diffusion.external.CompVisDenoiser
-            sigmas = self.model_wrap.get_sigmas(steps)
-        return sigmas
-        
-    def sample(self, p:StableDiffusionProcessing, x:Tensor, 
-               conditioning:MulticondLearnedConditioning, unconditional_conditioning:ScheduledPromptConditioning, 
-               steps:int=None, image_conditioning:Tensor=None):
-
-        steps = steps or p.steps
-        # sigmas: [16=steps+1], sigma[0]=14.6116 && sigma[-1]=0.0 都是常量，中间是递减的插值(指数衰减？)
-        sigmas = self.get_sigmas(p, steps)
-        # x: [B=1, C=4, H=64, W=64]
-        x = x * sigmas[0]
-
-        extra_params_kwargs = self.initialize(p)
-        if 'sigma_min' in inspect.signature(self.func).parameters:
-            extra_params_kwargs['sigma_min'] = self.model_wrap.sigmas[0].item()
-            extra_params_kwargs['sigma_max'] = self.model_wrap.sigmas[-1].item()
-            if 'n' in inspect.signature(self.func).parameters:
-                extra_params_kwargs['n'] = steps
-        else:
-            extra_params_kwargs['sigmas'] = sigmas
-
-        self.last_latent = x        # [1, 4, 64, 64]
-
-        samples = self.launch_sampling(steps, lambda: self.func(self.model_wrap_cfg, p.sd_model, x, extra_args={
-            'cond': conditioning,                   # prompt cond
-            'image_cond': image_conditioning,       # [1, 5, 1, 1], dummy
-            'uncond': unconditional_conditioning,   # negaivte prompt cond
-            'cond_scale': p.cfg_scale               # 7.0
-        }, callback=self.callback_state, **extra_params_kwargs))
-
-        return samples
-
-    def sample_img2img(self, p:StableDiffusionProcessing, x:Tensor, noise:Tensor, 
-                       conditioning:MulticondLearnedConditioning, unconditional_conditioning:ScheduledPromptConditioning, 
-                       steps:int=None, image_conditioning:Tensor=None):
-        
-        steps, t_enc = setup_img2img_steps(p, steps)
-
-        sigmas = self.get_sigmas(p, steps)
-        sigma_sched = sigmas[steps - t_enc - 1:]
-        xi = x + noise * sigma_sched[0]
-        
-        extra_params_kwargs = self.initialize(p)
-        if 'sigma_min' in inspect.signature(self.func).parameters:
-            ## last sigma is zero which isn't allowed by DPM Fast & Adaptive so taking value before last
-            extra_params_kwargs['sigma_min'] = sigma_sched[-2]
-        if 'sigma_max' in inspect.signature(self.func).parameters:
-            extra_params_kwargs['sigma_max'] = sigma_sched[0]
-        if 'n' in inspect.signature(self.func).parameters:
-            extra_params_kwargs['n'] = len(sigma_sched) - 1
-        if 'sigma_sched' in inspect.signature(self.func).parameters:
-            extra_params_kwargs['sigma_sched'] = sigma_sched
-        if 'sigmas' in inspect.signature(self.func).parameters:
-            extra_params_kwargs['sigmas'] = sigma_sched
-
-        self.model_wrap_cfg.init_latent = x
-        self.last_latent = x
-
-        samples = self.launch_sampling(t_enc + 1, lambda: self.func(self.model_wrap_cfg, p.sd_model, xi, extra_args={
-            'cond': conditioning, 
-            'image_cond': image_conditioning, 
-            'uncond': unconditional_conditioning, 
-            'cond_scale': p.cfg_scale
-        }, callback=self.callback_state, **extra_params_kwargs))
-
-        return samples
-
-# ↑↑↑ the above is modified from 'modules/sd_samplers.py' ↑↑↑
-
-
 # ↓↓↓ the following is modified from 'k_diffusion/sampling.py' ↓↓↓
 
-from tqdm.auto import trange
-from modules.sd_samplers import CFGDenoiser
-from ldm.models.diffusion.ddpm import LatentDiffusion
-
-def append_dims(x, target_dims):
-    """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
-    dims_to_append = target_dims - x.ndim
-    if dims_to_append < 0:
-        raise ValueError(f'input has {x.ndim} dims but target_dims is {target_dims}, which is less')
-    return x[(...,) + (None,) * dims_to_append]
-
-def to_d(x, sigma, denoised):
-    """Converts a denoiser output to a Karras ODE derivative."""
-    # 就是零阶差分，数除sigma以放缩数值
-    #return (x - denoised) / append_dims(sigma, x.ndim)
-    return (x - denoised) / sigma
-
-def get_ancestral_step(sigma_from, sigma_to, eta=1.):
-    """Calculates the noise level (sigma_down) to step down to and the amount
-    of noise to add (sigma_up) when doing an ancestral sampling step."""
-    if not eta:
-        return sigma_to, 0.
-    sigma_up = min(sigma_to, eta * (sigma_to ** 2 * (sigma_from ** 2 - sigma_to ** 2) / sigma_from ** 2) ** 0.5)
-    sigma_down = (sigma_to ** 2 - sigma_up ** 2) ** 0.5
-    return sigma_down, sigma_up
-
 def show_featmap(x, title=''):
-    if 'not show': return
+    if not FEAT_MAP_PATH: return
+
     import os
     import matplotlib.pyplot as plt
-    IMG_SAVE_PATH = r'C:\Workspace\stable-diffusion-webui-note\img_sampling_process'
-    x_np = x.squeeze().cpu().numpy()
+    os.makedirs(FEAT_MAP_PATH, exist_ok=True)
+
+    x_np = x[0].cpu().numpy()    # [C=4, H=64, W=64]
     x_np_abs = np.abs(x_np)
     print(f'[{title}]')
     print('   x_np:',     x_np    .max(), x_np    .min(), x_np    .mean(), x_np    .std())
     print('   x_np_abs:', x_np_abs.max(), x_np_abs.min(), x_np_abs.mean(), x_np_abs.std())
     for i in range(4):
+        plt.axis('off')
         plt.subplot(2, 2, i+1)
         plt.imshow(x_np[i])
     plt.suptitle(title)
-    plt.savefig(os.path.join(IMG_SAVE_PATH, f'{title}.png'))
-    plt.show()
+    plt.tight_layout()
+    plt.savefig(os.path.join(FEAT_MAP_PATH, f'{title}.png'))
 
-def sample_euler_ancestral_momentum_grad(model:CFGDenoiser, sd_model:LatentDiffusion, x:Tensor, sigmas:List, extra_args={}, callback=None, eta=1.):
+@torch.no_grad()
+def sample_naive(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, callback=None, *args):
+    '''
+    采样的本质是寻找降噪模型在某输入维度(图隐层维度)上的不动点，通过反复查询、依近似梯度来优化选点
+    你可以基于该模板快速开发 K-Diffusion 采样器 :)
+    '''
+    # type(model)                                                               modules.sd_samplers.CFGDenoiser
+    # type(model.inner_model)                                                   k_diffusion.external.CompVisDenoiser
+    # type(model.inner_model.inner_model)                                       ldm.models.diffusion.ddpm.LatentDiffusion
+    # type(model.inner_model.inner_model.first_stage_model)                     ldm.models.autoencoder.AutoencoderKL
+    # type(model.inner_model.inner_model.cond_stage_model)                      modules.sd_hijack.FrozenCLIPEmbedderWithCustomWords
+    # type(model.inner_model.inner_model.cond_stage_model.wrapped)              ldm.modules.encoders.modules.FrozenCLIPEmbedder
+    # type(model.inner_model.inner_model.cond_stage_model.wrapped.tokenizer)    transformers.models.clip.tokenization_clip.CLIPTokenizer
+    # type(model.inner_model.inner_model.cond_stage_model.wrapped.transformer)  transformers.models.clip.modeling_clip.CLIPTextModel
+    # type(model.inner_model.inner_model.model)                                 ldm.models.diffusion.ddpm.DiffusionWrapper
+    # type(model.inner_model.inner_model.model.diffusion_model)                 ldm.modules.diffusionmodules.openaimodel.UNetModel
+    # x                                                                         Tensor([B, C=4, H, W]), x8 downsampled
+    # sigmas                                                                    Tensor([T]), steps
+    # extra_args['cond']                                                        MulticondLearnedConditioning, prompt cond
+    # extra_args['uncond']                                                      List[List[ScheduledPromptConditioning]], negaivte prompt cond
+    # extra_args['image_cond']                                                  Tensor(), mask for img2img; Tensor([1, 5, 1, 1]), dummy for txt2img
+    # extra_args['cond_scale']                                                  int, e.g.: 7.0
+    # callback                                                                  KDiffusionSampler.callback_state(dict)
+    # *args                                                                     see `sampler_extra_params_sonar`
+
+    s_in = x.new_ones([x.shape[0]])         # expand_dim
+    for i in trange(len(sigmas) - 1):
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        if callback is not None: callback({'i': i, 'denoised': denoised})
+        d = to_d(x, sigmas[i], denoised)    # dy/dx
+        dt = sigmas[i + 1] - sigmas[i]      # dx
+        x = x + d * dt                      # x += dx * dy/dx
+    return x
+
+@torch.no_grad()
+def sample_naive_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, callback=None):
+    sd_model: LatentDiffusion = model.inner_model.inner_model
+
+    momentum           = settings['momentum']
+    momentum_sign      = settings['momentum_sign']
+    momentum_hist      = settings['momentum_hist']
+    momentum_hist_init = settings['momentum_hist_init']
+    grad_c_iter        = settings['grad_c_iter']
+    grad_c_alpha       = settings['grad_c_alpha']
+    grad_c_skip        = settings['grad_c_skip']
+    grad_x_iter        = settings['grad_x_iter']
+    grad_x_alpha       = settings['grad_x_alpha']
+    grad_fuzzy         = settings['grad_fuzzy']
+    ref_hgf            = settings['ref_hgf']
+    ref_meth           = settings['ref_meth']
+    ref_img            = settings['ref_img']
+    ref_min_step       = settings['ref_min_step']
+    ref_max_step       = settings['ref_max_step']
+
+    # memorize delta momentum
+    if   momentum_hist_init == 'zero':      history_d = 0
+    elif momentum_hist_init == 'rand_init': history_d = x
+    elif momentum_hist_init == 'rand_new':  history_d = torch.randn_like(x)
+    else: raise ValueError(f'unknown momentum_hist_init: {momentum_hist_init}')
+
+    # prepare ref_img latent
+    if ref_img is not None:
+        img = Image.open(ref_img).convert('RGB')
+        x_ref = torch.from_numpy(np.asarray(img)).moveaxis(2, 0)    # [C=3, H, W]
+        x_ref = (x_ref / 255) * 2 - 1
+        x_ref = x_ref.unsqueeze(dim=0).expand(x.shape[0], -1, -1, -1)  # [B, C=3, H, W]
+        x_ref = x_ref.to(sd_model.first_stage_model.device)
+
+        with devices.autocast():
+            latent_ref = sd_model.get_first_stage_encoding(sd_model.encode_first_stage(x_ref))     # [B, C=4, H=64, W=64]
+
+            avg_s = latent_ref.mean(dim=[1, 2, 3], keepdim=True)
+            std_s = latent_ref.std (dim=[1, 2, 3], keepdim=True)
+            ref_img_norm = (latent_ref - avg_s) / std_s
+    
+    # stochastics in gradient optimizing
+    noise = None if grad_fuzzy else torch.randn_like(x)
+    t     = None if grad_fuzzy else torch.randint(0, sd_model.num_timesteps, (x.shape[0],), device=sd_model.device).long()
+
+    s_in = x.new_ones([x.shape[0]])
+    n_steps = len(sigmas) - 1
+    for i in trange(n_steps):
+        if state.interrupted: break
+
+        # denoise step
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        if callback is not None: callback({'i': i, 'denoised': denoised})
+        
+        # grad step
+        d = to_d(x, sigmas[i], denoised)
+        dt = sigmas[i + 1] - sigmas[i]
+
+        # momentum step
+        if momentum < 1.0:
+            # decide correct direction
+            sign = momentum_sign
+            if sign == 'rand': sign = random.choice(['pos', 'neg'])
+
+            # correct current `d` with momentum
+            p = 1.0 - momentum
+            if   sign == 'pos': momentum_d = (1.0 - p) * d + p * history_d
+            elif sign == 'neg': momentum_d = (1.0 + p) * d - p * history_d
+            else: raise ValueError(f'unknown momentum sign {sign}')
+            
+            # Euler method with momentum
+            x = x + momentum_d * dt
+
+            # update momentum history
+            q = 1.0 - momentum_hist
+            if (isinstance(history_d, int) and history_d == 0):
+                history_d = momentum_d
+            else:
+                if   sign == 'pos': history_d = (1.0 - q) * history_d + q * momentum_d
+                elif sign == 'neg': history_d = (1.0 + q) * history_d - q * momentum_d
+                else: raise ValueError(f'unknown momentum sign {sign}')
+        else:
+            # Euler method original
+            x = x + d * dt
+
+        # guidance step
+        if ref_img is not None and ref_hgf and ref_min_step <= i <= ref_max_step:
+            # TODO: make scheduling for hgf?
+            if ref_meth == 'euler':
+                # rescale `ref_img` to match distribution
+                avg_t = denoised.mean(dim=[1, 2, 3], keepdim=True)
+                std_t = denoised.std (dim=[1, 2, 3], keepdim=True)
+                ref_img_shift = ref_img_norm * std_t + avg_t
+
+                d = to_d(x, sigmas[i], ref_img_shift)
+                dt = (sigmas[i + 1] - sigmas[i]) * ref_hgf
+                x = x + d * dt
+            if ref_meth == 'linear':
+                # rescale `ref_img` to match distribution
+                avg_t = x.mean(dim=[1, 2, 3], keepdim=True)
+                std_t = x.std (dim=[1, 2, 3], keepdim=True)
+                ref_img_shift = ref_img_norm * std_t + avg_t
+
+                x = (1 - ref_hgf) * x + ref_hgf * ref_img_shift
+
+        # inprocess-optimizing prompt condition
+        if i >= grad_c_skip and grad_c_iter:
+            c = mlc_get_cond(extra_args['cond']).unsqueeze(dim=0)
+
+            for i in trange(grad_c_iter):
+                if state.interrupted: break
+
+                with torch.enable_grad():
+                    c = c.detach().clone() ; c.requires_grad = True
+                    x = x.detach().clone() ; x.requires_grad = True
+
+                    loss = get_latent_loss(sd_model, x, t, c, noise)
+                    grad = torch.autograd.grad(loss, inputs=c, grad_outputs=loss)[0]
+
+                with torch.no_grad():
+                    print(f'loss_c: {loss.mean().item():.7f}, grad_c: {grad.mean().item():.7f}')
+
+                c = c.detach() - grad.sign() * grad_c_alpha
+            
+            mlc_replace_cond_inplace(extra_args['cond'], c.squeeze(dim=0))
+        
+        # noise step alike ancestral
+        if i <= n_steps - 1:
+            x = x + torch.randn_like(x) * 1e-5
+
+    # post-optimizing image latent
+    if grad_x_iter:
+        c = mlc_get_cond(extra_args['cond']).unsqueeze(dim=0)
+
+        for i in trange(grad_x_iter):
+            if state.interrupted: break
+
+            with torch.enable_grad():
+                c = c.detach().clone() ; c.requires_grad = True
+                x = x.detach().clone() ; x.requires_grad = True
+
+                loss = get_latent_loss(sd_model, x, t, c, noise)
+                grad = torch.autograd.grad(loss, inputs=x, grad_outputs=loss)[0]
+
+            with torch.no_grad():
+                print(f'loss_x: {loss.mean().item():.7f}, grad_x: {grad.mean().item():.7f}')
+
+            x = x.detach() - grad.sign() * grad_x_alpha
+
+    return x
+
+@torch.no_grad()
+def sample_euler_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, callback=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1.):
+    momentum           = settings['momentum']
+    momentum_sign      = settings['momentum_sign']
+    momentum_hist      = settings['momentum_hist']
+    momentum_hist_init = settings['momentum_hist_init']
+
+    # 记录梯度历史的惯性
+    if   momentum_hist_init == 'zero':      history_d = 0
+    elif momentum_hist_init == 'rand_init': history_d = x
+    elif momentum_hist_init == 'rand_new':  history_d = torch.randn_like(x)
+    else: raise ValueError(f'unknown momentum_hist_init: {momentum_hist_init}')
+
+    s_in = x.new_ones([x.shape[0]])
+    n_steps = len(sigmas) - 1
+    for i in trange(n_steps):
+        gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
+        eps = torch.randn_like(x) * s_noise
+        sigma_hat = sigmas[i] * (gamma + 1)
+        if gamma > 0: x = x + eps * (sigma_hat ** 2 - sigmas[i] ** 2) ** 0.5
+
+        denoised = model(x, sigma_hat * s_in, **extra_args)
+        if callback is not None: callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigma_hat, 'denoised': denoised})
+
+        d = to_d(x, sigma_hat, denoised)
+        dt = sigmas[i + 1] - sigma_hat
+
+        if 'momentum step':
+            # decide correct direction
+            sign = momentum_sign
+            action_pool = ['pos', 'neg']
+            if   sign == 'rand'   : sign = random.choice(action_pool)
+            elif sign == 'pos_neg': sign = action_pool[int(i < n_steps // 2)]
+            elif sign == 'neg_pos': sign = action_pool[int(i > n_steps // 2)]
+            else: pass
+
+            # correct current `d` with momentum
+            p = 1.0 - momentum
+            if   sign == 'pos': momentum_d = (1.0 - p) * d + p * history_d
+            elif sign == 'neg': momentum_d = (1.0 + p) * d - p * history_d
+            else: raise ValueError(f'unknown momentum sign {sign}')
+            
+            # Euler method with momentum
+            x = x + momentum_d * dt
+
+            # update momentum history
+            q = 1.0 - momentum_hist
+            if (isinstance(history_d, int) and history_d == 0):
+                history_d = momentum_d
+            else:
+                if   sign == 'pos': history_d = (1.0 - q) * history_d + q * momentum_d
+                elif sign == 'neg': history_d = (1.0 + q) * history_d - q * momentum_d
+                else: raise ValueError(f'unknown momentum sign {sign}')
+        else:
+            # Euler method original
+            x = x + d * dt
+
+    return x
+
+@torch.no_grad()
+def sample_euler_ancestral_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, callback=None, eta=1.):
     momentum           = settings['momentum']
     momentum_sign      = settings['momentum_sign']
     momentum_hist      = settings['momentum_hist']
@@ -488,22 +635,22 @@ def sample_euler_ancestral_momentum_grad(model:CFGDenoiser, sd_model:LatentDiffu
     elif momentum_hist_init == 'rand_new':  history_d = torch.randn_like(x)
     else: raise ValueError(f'unknown momentum_hist_init: {momentum_hist_init}')
 
-    s_in = x.new_ones([x.shape[0]])     # [B=1], 不知道啥用，类型转换？
+    s_in = x.new_ones([x.shape[0]])     # [B=1]
     n_steps = len(sigmas) - 1
     for i in trange(n_steps):
-        # [1, 4, 64, 64], 一步降噪后，生成的图越来越明显
+        # [1, 4, 64, 64], 一步降噪后，生成的图越来越明显, sigma理解为步长dx
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         show_featmap(denoised, f'denoised (step {i})')
 
-        # 噪声差分 eps
-        delta = denoised - x
-        show_featmap(delta, f'delta (step {i})')
+        # 噪声差分 eps 应当服从正太分布
+        eps = denoised - x
+        show_featmap(eps, f'eps (step {i})')
 
         # scalar, sigma_down < sigma_up < sigmas[i + 1] < sigmas[i]
         sigma_down, sigma_up = get_ancestral_step(sigmas[i], sigmas[i + 1], eta=eta)
-        if callback is not None:
-            callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
-        d = to_d(x, sigmas[i], denoised)   # [1, 4, 64, 64], 这应该是某种梯度
+        if callback is not None: callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
+        # # [1, 4, 64, 64], 梯度 = dy/dx = (x - denoised) / sigmas[i]
+        d = to_d(x, sigmas[i], denoised)
         show_featmap(d, f'd (step {i}); sigma={sigmas[i]}')
 
         # ancestral scheduling (down)
@@ -512,7 +659,7 @@ def sample_euler_ancestral_momentum_grad(model:CFGDenoiser, sd_model:LatentDiffu
             # decide correct direction
             sign = momentum_sign
             action_pool = ['pos', 'neg']
-            if   sign == 'random' : sign = random.choice(action_pool)
+            if   sign == 'rand'   : sign = random.choice(action_pool)
             elif sign == 'pos_neg': sign = action_pool[int(i < n_steps // 2)]
             elif sign == 'neg_pos': sign = action_pool[int(i > n_steps // 2)]
             else: pass
@@ -556,147 +703,145 @@ def sample_euler_ancestral_momentum_grad(model:CFGDenoiser, sd_model:LatentDiffu
 
     return x
 
-def sample_euler_momentum_grad(model:CFGDenoiser, sd_model:LatentDiffusion, x, sigmas, extra_args={}, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1.):
-    s_in = x.new_ones([x.shape[0]])
-    for i in trange(len(sigmas) - 1, disable=disable):
-        gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
-        eps = torch.randn_like(x) * s_noise
-        sigma_hat = sigmas[i] * (gamma + 1)
-        if gamma > 0:
-            x = x + eps * (sigma_hat ** 2 - sigmas[i] ** 2) ** 0.5
-        denoised = model(x, sigma_hat * s_in, **extra_args)
-        d = to_d(x, sigma_hat, denoised)
-        if callback is not None:
-            callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigma_hat, 'denoised': denoised})
-        dt = sigmas[i + 1] - sigma_hat
-        # Euler method
-        x = x + d * dt
-    return x
-
-class DDIMSamplerHijack(DDIMSampler):
-
-    def __init__(self, model, schedule="linear", **kwargs):
-        super().__init__(model, schedule, **kwargs)
-    
-    @torch.no_grad()
-    def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
-                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None):
-        b, *_, device = *x.shape, x.device
-
-        if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            e_t = self.model.apply_model(x, t, c)
-        else:
-            x_in = torch.cat([x] * 2)
-            t_in = torch.cat([t] * 2)
-            c_in = torch.cat([unconditional_conditioning, c])
-            e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
-            e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
-
-        if score_corrector is not None:
-            assert self.model.parameterization == "eps"
-            e_t = score_corrector.modify_score(self.model, e_t, x, t, c, **corrector_kwargs)
-
-        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
-        # select parameters corresponding to the currently considered timestep
-        a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-        a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-        sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
-        sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
-
-        # current prediction for x_0
-        pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
-        if quantize_denoised:
-            pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
-        # direction pointing to x_t
-        dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-        noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
-        if noise_dropout > 0.:
-            noise = torch.nn.functional.dropout(noise, p=noise_dropout)
-        x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-        return x_prev, pred_x0
-
-class PLMSSamplerHijack(PLMSSampler):
-
-    def __init__(self, model, schedule="linear", **kwargs):
-        super().__init__(model, schedule, **kwargs)
-
-    @torch.no_grad()
-    def p_sample_plms(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
-                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None, old_eps=None, t_next=None):
-        b, *_, device = *x.shape, x.device
-
-        def get_model_output(x, t):
-            if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-                e_t = self.model.apply_model(x, t, c)
-            else:
-                x_in = torch.cat([x] * 2)
-                t_in = torch.cat([t] * 2)
-                c_in = torch.cat([unconditional_conditioning, c])
-                e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
-                e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
-
-            if score_corrector is not None:
-                assert self.model.parameterization == "eps"
-                e_t = score_corrector.modify_score(self.model, e_t, x, t, c, **corrector_kwargs)
-
-            return e_t
-
-        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
-
-        def get_x_prev_and_pred_x0(e_t, index):
-            # select parameters corresponding to the currently considered timestep
-            a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-            a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-            sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
-            sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
-
-            # current prediction for x_0
-            pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
-            if quantize_denoised:
-                pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
-            # direction pointing to x_t
-            dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-            noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
-            if noise_dropout > 0.:
-                noise = torch.nn.functional.dropout(noise, p=noise_dropout)
-            x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-            return x_prev, pred_x0
-
-        e_t = get_model_output(x, t)
-        if len(old_eps) == 0:
-            # Pseudo Improved Euler (2nd order)
-            x_prev, pred_x0 = get_x_prev_and_pred_x0(e_t, index)
-            e_t_next = get_model_output(x_prev, t_next)
-            e_t_prime = (e_t + e_t_next) / 2
-        elif len(old_eps) == 1:
-            # 2nd order Pseudo Linear Multistep (Adams-Bashforth)
-            e_t_prime = (3 * e_t - old_eps[-1]) / 2
-        elif len(old_eps) == 2:
-            # 3nd order Pseudo Linear Multistep (Adams-Bashforth)
-            e_t_prime = (23 * e_t - 16 * old_eps[-1] + 5 * old_eps[-2]) / 12
-        elif len(old_eps) >= 3:
-            # 4nd order Pseudo Linear Multistep (Adams-Bashforth)
-            e_t_prime = (55 * e_t - 59 * old_eps[-1] + 37 * old_eps[-2] - 9 * old_eps[-3]) / 24
-
-        x_prev, pred_x0 = get_x_prev_and_pred_x0(e_t_prime, index)
-
-        return x_prev, pred_x0, e_t
-
 # ↑↑↑ the above is modified from 'k_diffusion/sampling.py' ↑↑↑
 
 
-def image_to_latent(model, img: Image) -> Tensor:
-    #from ldm.models.diffusion import LatentDiffusion
-    # type(model) == LatentDiffusion
+# ↓↓↓ the following is modified from 'modules/sd_samplers.py' ↓↓↓
 
+all_samplers_sonar = [
+    # wrap the well-known samplers
+    SamplerData('Euler a', lambda model: KDiffusionSamplerHijack(model, 'sample_euler_ancestral_ex'), ['k_euler_a_ex'], {}),
+    SamplerData('Euler',   lambda model: KDiffusionSamplerHijack(model, 'sample_euler_ex'),           ['k_euler_ex'],   {}),
+    # my dev-playground
+    SamplerData('Naive',   lambda model: KDiffusionSamplerHijack(model, 'sample_naive_ex'),           ['naive_ex'],     {}),
+]
+sampler_extra_params_sonar = {
+    # 'sampler_name': ['param1', 'param2', ...]
+    'sample_euler_ex': ['s_churn', 's_tmin', 's_tmax', 's_noise'],
+}
+CHOICE_SAMPLER = [s.name for s in all_samplers_sonar]
+
+def create_sampler(sd_model):
+    for config in all_samplers_sonar:
+        if config.name == settings['sampler']:
+            sampler = config.constructor(sd_model)
+            sampler.config = config
+            return sampler
+
+    raise ValueError(f'implementaion of sampler {settings["sampler"]!r} not found')
+
+class KDiffusionSamplerHijack(KDiffusionSampler):
+
+    def __init__(self, sd_model, funcname):
+        # init the homogenus base sampler
+        super().__init__('sample_euler', sd_model)      # the 'funcname' this is dummy
+        # hijack the sampler object
+        self.funcname = funcname
+        self.func = globals().get(self.funcname)
+        self.extra_params = sampler_extra_params_sonar.get(funcname, [])
+
+    def get_sigmas(self, p:StableDiffusionProcessing, steps:int) -> List[float]:
+        if p.sampler_noise_scheduler_override:
+            sigmas = p.sampler_noise_scheduler_override(steps)
+        elif self.config is not None and self.config.options.get('scheduler', None) == 'karras':
+            sigmas = k_diffusion.sampling.get_sigmas_karras(n=steps, sigma_min=0.1, sigma_max=10, device=shared.device)
+        else:
+            # self.model_wrap: k_diffusion.external.CompVisDenoiser
+            sigmas = self.model_wrap.get_sigmas(steps)
+        return sigmas
+    
+    def sample(self, p:StableDiffusionProcessing, x:Tensor, 
+               conditioning:MulticondLearnedConditioning, unconditional_conditioning:ScheduledPromptConditioning, 
+               steps:int=None, image_conditioning:Tensor=None):
+
+        steps = steps or p.steps
+        # sigmas: [16=steps+1], sigma[0]=14.6116 && sigma[-1]=0.0 都是常量，中间是递减的插值(指数衰减？)
+        sigmas = self.get_sigmas(p, steps)
+        # x: [B=1, C=4, H=64, W=64]
+        x = x * sigmas[0]
+
+        extra_params_kwargs = self.initialize(p)
+        if 'sigma_min' in inspect.signature(self.func).parameters:
+            extra_params_kwargs['sigma_min'] = self.model_wrap.sigmas[0].item()
+            extra_params_kwargs['sigma_max'] = self.model_wrap.sigmas[-1].item()
+            if 'n' in inspect.signature(self.func).parameters:
+                extra_params_kwargs['n'] = steps
+        else:
+            extra_params_kwargs['sigmas'] = sigmas
+
+        self.last_latent = x        # [1, 4, 64, 64]
+
+        samples = self.launch_sampling(steps, lambda: self.func(self.model_wrap_cfg, x, extra_args={
+            'cond': conditioning,                   # prompt cond
+            'image_cond': image_conditioning,       # [1, 5, 1, 1], dummy
+            'uncond': unconditional_conditioning,   # negaivte prompt cond
+            'cond_scale': p.cfg_scale               # 7.0
+        }, callback=self.callback_state, **extra_params_kwargs))
+
+        return samples
+
+    def sample_img2img(self, p:StableDiffusionProcessing, x:Tensor, noise:Tensor, 
+                       conditioning:MulticondLearnedConditioning, unconditional_conditioning:ScheduledPromptConditioning, 
+                       steps:int=None, image_conditioning:Tensor=None):
+        
+        steps, t_enc = setup_img2img_steps(p, steps)
+        sigmas = self.get_sigmas(p, steps)
+        sigma_sched = sigmas[steps - t_enc - 1:]
+        xi = x + noise * sigma_sched[0]
+        
+        extra_params_kwargs = self.initialize(p)
+        if 'sigma_min' in inspect.signature(self.func).parameters:
+            ## last sigma is zero which isn't allowed by DPM Fast & Adaptive so taking value before last
+            extra_params_kwargs['sigma_min'] = sigma_sched[-2]
+        if 'sigma_max' in inspect.signature(self.func).parameters:
+            extra_params_kwargs['sigma_max'] = sigma_sched[0]
+        if 'n' in inspect.signature(self.func).parameters:
+            extra_params_kwargs['n'] = len(sigma_sched) - 1
+        if 'sigma_sched' in inspect.signature(self.func).parameters:
+            extra_params_kwargs['sigma_sched'] = sigma_sched
+        if 'sigmas' in inspect.signature(self.func).parameters:
+            extra_params_kwargs['sigmas'] = sigma_sched
+
+        self.model_wrap_cfg.init_latent = x
+        self.last_latent = x
+
+        samples = self.launch_sampling(t_enc + 1, lambda: self.func(self.model_wrap_cfg, xi, extra_args={
+            'cond': conditioning, 
+            'image_cond': image_conditioning, 
+            'uncond': unconditional_conditioning, 
+            'cond_scale': p.cfg_scale
+        }, callback=self.callback_state, **extra_params_kwargs))
+
+        return samples
+
+# ↑↑↑ the above is modified from 'modules/sd_samplers.py' ↑↑↑
+
+
+def get_latent_loss(self:LatentDiffusion, x:Tensor, t:Tensor, c:Tensor, noise:Tensor) -> Tensor:
+    # 这个t似乎是预训练时ImageNet的分类数，随便往一个类方向去引导, 貌似完全不影响结果
+    t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long() if t is None else t  # [B=1] 
+
+    x_start = x
+    noise = torch.randn_like(x_start) if noise is None else noise   # [B=1, C=4, H=64, W=64]
+    x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)      # [B=1, C=4, H=64, W=64], diffsusion step
+    model_output = self.apply_model(x_noisy, t, c)                  # [B=1, C=4, H=64, W=64], inverse diffusion step
+
+    if    self.parameterization == "x0":  target = x_start
+    elif  self.parameterization == "eps": target = noise            # it goes this way
+    else: raise NotImplementedError()
+
+    loss_simple = self.get_loss(model_output, target, mean=False)   # self.loss_type == 'l2'; the model shoud predict the noise that is added
+    logvar_t = self.logvar[t].to(self.device)                       # self.logvar == torch.zeros([1000])
+    loss = loss_simple / torch.exp(logvar_t) + logvar_t
+    loss = self.l_simple_weight * loss                              # self.l_simple_weight == 1.0
+
+    loss_vlb = self.get_loss(model_output, target, mean=False)
+    loss_vlb = (self.lvlb_weights[t] * loss_vlb)                    # self.lvlb_weights is non-zeros
+    loss += (self.original_elbo_weight * loss_vlb)                  # but self.original_elbo_weight == 0.0, I don't know why :(
+
+    return loss                                                     # [B=1, C=4, H=64, W=64]
+
+def image_to_latent(model:LatentDiffusion, img: Image) -> Tensor:
     im = np.array(img).astype(np.uint8)
     im = (im / 127.5 - 1.0).astype(np.float32)
     x = torch.from_numpy(im)
@@ -710,11 +855,9 @@ def image_to_latent(model, img: Image) -> Tensor:
 def mlc_get_cond(c:MulticondLearnedConditioning) -> Tensor:
     return c.batch[0][0].schedules[0].cond      # [B=1, T=77, D=768]
 
-def mlc_replace_cond(c:MulticondLearnedConditioning, cond: Tensor) -> MulticondLearnedConditioning:
-    r = deepcopy(c)
-    spc = r.batch[0][0].schedules[0]
-    r.batch[0][0].schedules[0] = ScheduledPromptConditioning(spc.end_at_step, cond)
-    return r
+def mlc_replace_cond_inplace(c:MulticondLearnedConditioning, cond: Tensor):
+    spc = c.batch[0][0].schedules[0]
+    c.batch[0][0].schedules[0] = ScheduledPromptConditioning(spc.end_at_step, cond)
 
 
 class Script(scripts.Script):
@@ -723,32 +866,86 @@ class Script(scripts.Script):
         return 'Sonar'
 
     def describe(self):
-        return "Tricks to optimize prompt condition and image latent for better image quality"
+        return "Wrapped samplers with tricks to optimize prompt condition and image latent for better image quality"
 
     def show(self, is_img2img):
-        return not is_img2img
+        return True
 
     def ui(self, is_img2img):
-        sampler = gr.Radio(label='Sampler', value=lambda: DEFAULT_SAMPLER, choices=CHOICE_SAMPLER)
+        sampler = gr.Radio(label='Base Sampler', value=lambda: DEFAULT_SAMPLER, choices=CHOICE_SAMPLER)
 
-        with gr.Row():
-            momentum      = gr.Slider(label='Momentum (current)', minimum=0.75, maximum=1.0, value=lambda: DEFAULT_MOMENTUM)
-            momentum_hist = gr.Slider(label='Momentum (history)', minimum=0.0, maximum=1.0, value=lambda: DEFAULT_MOMENTUM_HIST)
-        with gr.Row():
-            momentum_sign = gr.Radio(label='Momentum Sign', value=lambda: DEFAULT_MOMENTUM_SIGN, choices=CHOICE_MOMENTUM_SIGN)
-            momentum_hist_init = gr.Radio(label='Momentum init history', value=lambda: DEFAULT_MOMENTUM_HIST_INIT, choices=CHOICE_MOMENTUM_HIST_INIT)
+        with gr.Group() as tab_momentum:
+            with gr.Row():
+                momentum      = gr.Slider(label='Momentum (current)', minimum=0.75, maximum=1.0, value=lambda: DEFAULT_MOMENTUM)
+                momentum_hist = gr.Slider(label='Momentum (history)', minimum=0.0,  maximum=1.0, value=lambda: DEFAULT_MOMENTUM_HIST)
+            with gr.Row():
+                momentum_sign      = gr.Radio(label='Momentum sign',         value=lambda: DEFAULT_MOMENTUM_SIGN,      choices=CHOICE_MOMENTUM_SIGN)
+                momentum_hist_init = gr.Radio(label='Momentum history init', value=lambda: DEFAULT_MOMENTUM_HIST_INIT, choices=CHOICE_MOMENTUM_HIST_INIT)
+        
+        with gr.Group() as tab_gradient:
+            with gr.Row():
+                grad_c_iter  = gr.Slider(label='Optimize cond step count', value=lambda: DEFAULT_GRAD_C_ITER,  minimum=0,     maximum=10,   step=1)
+                grad_c_alpha = gr.Slider(label='Optimize cond step size',  value=lambda: DEFAULT_GRAD_C_ALPHA, minimum=-0.01, maximum=0.01, step=0.001)
+                grad_c_skip  = gr.Slider(label='Skip the first n-steps',   value=lambda: DEFAULT_GRAD_C_SKIP, minimum=0, maximum=100, step=1)
+            with gr.Row():
+                grad_x_iter  = gr.Slider(label='Optimize latent step count', value=lambda: DEFAULT_GRAD_X_ITER,  minimum=0,    maximum=40,  step=1)
+                grad_x_alpha = gr.Slider(label='Optimize latent step size',  value=lambda: DEFAULT_GRAD_X_ALPHA, minimum=-0.1, maximum=0.1, step=0.01)
+                grad_fuzzy   = gr.Checkbox(label='Fuzzy grad',               value=lambda: DEFAULT_GRAD_FUZZY)
 
-        return [sampler, momentum,  momentum_hist, momentum_hist_init, momentum_sign]
+        with gr.Group(visible=False) as tab_file:
+            with gr.Row():
+                ref_meth = gr.Radio(label='Guide step method', value=lambda: DEFAULT_REF_METH, choices=CHOICE_REF_METH)
+                ref_hgf = gr.Slider(label='Guide factor', value=lambda: DEFAULT_REF_HGF, minimum=-1, maximum=1, step=0.001)
+                ref_min_step = gr.Number(label='Ref start step', value=lambda: DEFAULT_REF_MIN_STEP)
+                ref_max_step = gr.Number(label='Ref stop step', value=lambda: DEFAULT_REF_MAX_STEP)
+            with gr.Row():
+                ref_img = gr.File(label='Reference image file', interactive=True)
+
+        def swith_sampler(sampler:str):
+            SHOW_TABS = {
+                # (show_momt, show_grad, show_file)
+                'Euler a': (True, False, False),
+                'Euler':   (True, False, False),
+                'Naive':   (True, True,  True),
+            }
+            show_momt, show_grad, show_file = SHOW_TABS[sampler]
+            return [   
+                { 'visible': show_momt, '__type__': 'update' },
+                { 'visible': show_grad, '__type__': 'update' },
+                { 'visible': show_file, '__type__': 'update' },
+            ]
+
+        sampler.change(swith_sampler, inputs=[sampler], outputs=[tab_momentum, tab_gradient, tab_file])
+
+        return [sampler, 
+                momentum, momentum_hist, momentum_hist_init, momentum_sign, 
+                grad_c_iter, grad_c_alpha, grad_c_skip, grad_x_iter, grad_x_alpha, grad_fuzzy,
+                ref_meth, ref_hgf, ref_min_step, ref_max_step, ref_img]
     
     def run(self, p:StableDiffusionProcessing, sampler:str, 
-            momentum:float, momentum_hist:float, momentum_hist_init:str, momentum_sign:str):
+            momentum:float, momentum_hist:float, momentum_hist_init:str, momentum_sign:str,
+            grad_c_iter:int, grad_c_alpha:float, grad_c_skip:int, grad_x_iter:int, grad_x_alpha:float, grad_fuzzy:bool,
+            ref_meth:str, ref_hgf:float, ref_min_step:float, ref_max_step:float, ref_img:object):
         
-        # save settings to globa;
+        # save settings to global
         settings['sampler']            = sampler
         settings['momentum']           = momentum
         settings['momentum_hist']      = momentum_hist
         settings['momentum_hist_init'] = momentum_hist_init
         settings['momentum_sign']      = momentum_sign
+        settings['grad_c_iter']        = grad_c_iter
+        settings['grad_c_alpha']       = grad_c_alpha
+        settings['grad_c_skip']        = int(grad_c_skip)
+        settings['grad_x_iter']        = grad_x_iter
+        settings['grad_x_alpha']       = grad_x_alpha
+        settings['grad_fuzzy']         = grad_fuzzy
+        settings['ref_meth']           = ref_meth
+        settings['ref_min_step']       = int(ref_min_step) if ref_min_step > 1 else round(ref_min_step * p.steps)
+        settings['ref_max_step']       = int(ref_max_step) if ref_max_step > 1 else round(ref_max_step * p.steps)
+        settings['ref_hgf']            = ref_hgf
+        settings['ref_img']            = ref_img
+
+        #pp(settings)
 
         state.job_count = p.n_iter * p.batch_size
         proc = process_images(p)
