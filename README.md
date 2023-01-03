@@ -1,8 +1,18 @@
 # stable-diffusion-webui-sonar
 
-    Wrapped k-diffuison samplers with tricks to improve the generated image quality, extension script for AUTOMATIC1111/stable-diffusion-webui
+    Wrapped k-diffuison samplers with tricks to improve the generated image quality (maybe?), extension script for AUTOMATIC1111/stable-diffusion-webui
 
 ----
+
+<p align="left">
+  <a href="https://github.com/Kahsolt/stable-diffusion-webui-sonar/commits"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/Kahsolt/stable-diffusion-webui-sonar"></a>
+  <a href="https://github.com/Kahsolt/stable-diffusion-webui-sonar/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/Kahsolt/stable-diffusion-webui-sonar"></a>
+  <a href="https://github.com/Kahsolt/stable-diffusion-webui-sonar/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/Kahsolt/stable-diffusion-webui-sonar"></a>
+  <a href="https://github.com/Kahsolt/stable-diffusion-webui-sonar/network"><img alt="GitHub forks" src="https://img.shields.io/github/forks/Kahsolt/stable-diffusion-webui-sonar"></a>
+  <img alt="Language" src="https://img.shields.io/github/languages/top/Kahsolt/stable-diffusion-webui-sonar">
+  <img alt="License" src="https://img.shields.io/github/license/Kahsolt/stable-diffusion-webui-sonar">
+  <br/>
+</p>
 
 ℹ This is the sister repo of [https://github.com/Kahsolt/stable-diffusion-webui-prompt-travel](https://github.com/Kahsolt/stable-diffusion-webui-prompt-travel), it focuses on **single prompt optimization** rather than traveling between multiple prompts. 
 
@@ -21,10 +31,18 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 
 ### Change Log
 
+⚪ Features
+
 - 2022/11/27: add momentum on `Euler`, add hard ref-image guidance on `Naive`
 - 2022/11/20: add an Euler-like `Naive`, the simplest difference-estimation-based sampler with momentum & gradient
 - 2022/11/18: add momentum on `Euler a`
 
+⚪ Fixups
+
+- 2023/01/03: fix issue #1 with webui's updates (error `AttributeError: 'StableDiffusionProcessingTxt2Img' object has no attribute 'firstphase_height'`)
+
+
+### Examples
 
 ⚪ momentum
 
@@ -102,12 +120,12 @@ This repo allows your to quickly implement your own k-diffusion samplers, follow
 
 Easiest way to install it is to:
 1. Go to the "Extensions" tab in the webui, switch to the "Install from URL" tab
-2. Paste https://github.com/Kahsolt/stable-diffusion-webui-sonar.git into "URL for extension's git repository", click "install" button
-3. Go to the "Installed" tab, click "Apply and Restart UI" button
+2. Paste https://github.com/Kahsolt/stable-diffusion-webui-sonar.git into "URL for extension's git repository" and click install
+3. (Optional) You will need to restart the webui for dependencies to be installed or you won't be able to generate video files
 
 Manual install:
 1. Copy this repo folder to the 'extensions' folder of https://github.com/AUTOMATIC1111/stable-diffusion-webui
-2. Go to the "Settings" tab, click "Restart Gradio and Refresh components" button
+2. (Optional) Restart the webui
 
 ----
 
