@@ -37,12 +37,14 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 
 ⚪ Features
 
+- 2023/01/12: remove gradient-related functionality due to webui code change
 - 2022/11/27: add momentum on `Euler`, add hard ref-image guidance on `Naive`
 - 2022/11/20: add an Euler-like `Naive`, the simplest difference-estimation-based sampler with momentum & gradient
 - 2022/11/18: add momentum on `Euler a`
 
 ⚪ Fixups
 
+- 2023/01/12: fix issue #2 with webui's updates (error `AttributeError: 'Options' object has no attribute 'filter_nsfw'`)
 - 2023/01/03: fix issue #1 with webui's updates (error `AttributeError: 'StableDiffusionProcessingTxt2Img' object has no attribute 'firstphase_height'`)
 
 
@@ -52,13 +54,6 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 
 ![momentum.png](img/momentum.png)
 
-⚪ grad on condition
-
-![grad_c.png](img/grad_c.png)
-
-⚪ grad on latent
-
-![grad_x.png](img/grad_x.png)
 
 ⚪ ref_img guide
 
@@ -90,15 +85,6 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
     - `neg`: correct by opposite direction of history momentum, denying the history
     - `rand`: random choose from above at each sampling step
     - NOTE: option `neg` and `pos_neg` works well only if `momentum_hist` is enough large (`~0.9`)
-- grad_*
-  - grad_w_cond: (float), loss weight for optimizing prompt condition
-  - grad_c_iter: (int), optimizing step count **per sampling step** for condition
-  - grad_c_alpha: (float), optimizing step size for condition
-  - grad_c_skip: (int), skip cond optimizing for the first n-steps
-  - grad_w_latent: (float), loss weight for optimizing image latent
-  - grad_x_iter: (int), optimizing step count for latent (this is NOT per sampling step)
-  - grad_x_alpha: (float), optimizing step size for latent
-  - grad_fuzzy: (bool), use fuzzy gradient for both
 - ref_*
   - ref_img: (file), reference image file
   - ref_meth: (categorical)
@@ -125,11 +111,9 @@ This repo allows your to quickly implement your own k-diffusion samplers, follow
 Easiest way to install it is to:
 1. Go to the "Extensions" tab in the webui, switch to the "Install from URL" tab
 2. Paste https://github.com/Kahsolt/stable-diffusion-webui-sonar.git into "URL for extension's git repository" and click install
-3. (Optional) You will need to restart the webui for dependencies to be installed or you won't be able to generate video files
 
 Manual install:
 1. Copy this repo folder to the 'extensions' folder of https://github.com/AUTOMATIC1111/stable-diffusion-webui
-2. (Optional) Restart the webui
 
 ----
 
