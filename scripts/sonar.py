@@ -1,7 +1,7 @@
 import os
 import random
 from PIL import Image
-from typing import List
+from typing import List, Tuple
 from pprint import pprint as pp
 
 import gradio as gr
@@ -11,9 +11,12 @@ import numpy as np
 from tqdm.auto import trange
 
 from modules import scripts, devices
-from modules.shared import state, opts
+from modules.script_callbacks import on_before_image_saved, remove_callbacks_for_function, ImageSaveParams
+from modules.shared import state, opts, sd_upscalers
 from modules.sd_samplers import *
+from modules.ui import gr_show
 from modules.prompt_parser import ScheduledPromptConditioning, MulticondLearnedConditioning
+from modules.images import resize_image
 from k_diffusion.sampling import to_d, get_ancestral_step
 from ldm.models.diffusion.ddpm import LatentDiffusion
 
@@ -27,10 +30,15 @@ DEFAULT_REF_HGF            = 0.01
 DEFAULT_REF_MIN_STEP       = 0.0
 DEFAULT_REF_MAX_STEP       = 0.75
 DEFAULT_REF_IMG            = None
+DEFAULT_UPSCALE_METH       = 'Lanczos'
+DEFAULT_UPSCALE_RATIO      = 1.0
+DEFAULT_UPSCALE_W          = 0
+DEFAULT_UPSCALE_H          = 0
 
 CHOICE_MOMENTUM_SIGN      = ['pos', 'neg', 'rand']
 CHOICE_MOMENTUM_HIST_INIT = ['zero', 'rand_init', 'rand_new']
 CHOICE_REF_METH           = ['linear', 'euler']
+CHOICE_UPSCALER           = [x.name for x in sd_upscalers]
 
 # debug save latent featmap (when `Euler a`)
 #FEAT_MAP_PATH = 'C:\sd-webui_featmaps'
@@ -813,6 +821,19 @@ class KDiffusionSamplerHijack(KDiffusionSampler):
 
 # ↑↑↑ the above is modified from 'modules/sd_samplers.py' ↑↑↑
 
+def get_upscale_resolution(p:StableDiffusionProcessing, upscale_meth:str, upscale_ratio:float, upscale_width:int, upscale_height:int) -> Tuple[bool, Tuple[int, int]]:
+    if upscale_meth == 'None':
+        return False, (p.width, p.height)
+
+    if upscale_width == upscale_height == 0:
+        if upscale_ratio == 1.0:
+            return False, (p.width, p.height)
+        else:
+            return True, (round(p.width * upscale_ratio), round(p.height * upscale_ratio))
+    else:
+        if upscale_width  == 0: upscale_width  = round(p.width  * upscale_height / p.height)
+        if upscale_height == 0: upscale_height = round(p.height * upscale_width  / p.width)
+        return True, (upscale_width, upscale_height)
 
 class Script(scripts.Script):
 
@@ -829,20 +850,20 @@ class Script(scripts.Script):
         sampler = gr.Radio(label='Base Sampler', value=lambda: DEFAULT_SAMPLER, choices=CHOICE_SAMPLER)
 
         with gr.Group() as tab_momentum:
-            with gr.Row():
+            with gr.Row(variant='compact'):
                 momentum      = gr.Slider(label='Momentum (current)', minimum=0.75, maximum=1.0, value=lambda: DEFAULT_MOMENTUM)
                 momentum_hist = gr.Slider(label='Momentum (history)', minimum=0.0,  maximum=1.0, value=lambda: DEFAULT_MOMENTUM_HIST)
-            with gr.Row():
+            with gr.Row(variant='compact'):
                 momentum_sign      = gr.Radio(label='Momentum sign',         value=lambda: DEFAULT_MOMENTUM_SIGN,      choices=CHOICE_MOMENTUM_SIGN)
                 momentum_hist_init = gr.Radio(label='Momentum history init', value=lambda: DEFAULT_MOMENTUM_HIST_INIT, choices=CHOICE_MOMENTUM_HIST_INIT)
         
         with gr.Group(visible=False) as tab_file:
-            with gr.Row():
+            with gr.Row(variant='compact'):
                 ref_meth = gr.Radio(label='Ref guide step method', value=lambda: DEFAULT_REF_METH, choices=CHOICE_REF_METH)
                 ref_hgf = gr.Slider(label='Ref guide factor', value=lambda: DEFAULT_REF_HGF, minimum=-1, maximum=1, step=0.001)
                 ref_min_step = gr.Number(label='Ref start step', value=lambda: DEFAULT_REF_MIN_STEP)
                 ref_max_step = gr.Number(label='Ref stop step', value=lambda: DEFAULT_REF_MAX_STEP)
-            with gr.Row():
+            with gr.Row(variant='compact'):
                 ref_img = gr.File(label='Reference image file', interactive=True)
 
         def swith_sampler(sampler:str):
@@ -853,20 +874,27 @@ class Script(scripts.Script):
                 'Naive':   (True, True),
             }
             show_momt, show_file = SHOW_TABS[sampler]
-            return [   
-                { 'visible': show_momt, '__type__': 'update' },
-                { 'visible': show_file, '__type__': 'update' },
+            return [
+                gr_show(show_momt),
+                gr_show(show_file),
             ]
-
         sampler.change(swith_sampler, inputs=[sampler], outputs=[tab_momentum, tab_file])
+
+        with gr.Row(variant='compact'):
+            upscale_meth   = gr.Dropdown(label='Upscaler', value=lambda: DEFAULT_UPSCALE_METH,  choices=CHOICE_UPSCALER)
+            upscale_ratio  = gr.Slider  (label='Upscale ratio',  value=lambda: DEFAULT_UPSCALE_RATIO, minimum=1.0, maximum=4.0, step=0.1)
+            upscale_width  = gr.Slider  (label='Upscale width',  value=lambda: DEFAULT_UPSCALE_W, minimum=0, maximum=2048, step=8)
+            upscale_height = gr.Slider  (label='Upscale height', value=lambda: DEFAULT_UPSCALE_H, minimum=0, maximum=2048, step=8)
 
         return [sampler, 
                 momentum, momentum_hist, momentum_hist_init, momentum_sign, 
-                ref_meth, ref_hgf, ref_min_step, ref_max_step, ref_img]
+                ref_meth, ref_hgf, ref_min_step, ref_max_step, ref_img,
+                upscale_meth, upscale_ratio, upscale_width, upscale_height]
     
     def run(self, p:StableDiffusionProcessing, sampler:str, 
             momentum:float, momentum_hist:float, momentum_hist_init:str, momentum_sign:str,
-            ref_meth:str, ref_hgf:float, ref_min_step:float, ref_max_step:float, ref_img:object):
+            ref_meth:str, ref_hgf:float, ref_min_step:float, ref_max_step:float, ref_img:object,
+            upscale_meth:str, upscale_ratio:float, upscale_width:int, upscale_height:int):
         
         # save settings to global
         settings['sampler']            = sampler
@@ -882,7 +910,16 @@ class Script(scripts.Script):
 
         #pp(settings)
 
+        enabled, (tgt_w, tgt_h) = get_upscale_resolution(p, upscale_meth, upscale_ratio, upscale_width, upscale_height)
+        if enabled: print(f'>> upscale: ({p.width}, {p.height}) => ({tgt_w}, {tgt_h})')
+
+        def save_image_hijack(params:ImageSaveParams):
+            if not enabled: return
+            params.image = resize_image(1, params.image, tgt_w, tgt_h, upscaler_name=upscale_meth)
+
         state.job_count = p.n_iter * p.batch_size
+        on_before_image_saved(save_image_hijack)
         proc = process_images(p)
+        remove_callbacks_for_function(save_image_hijack)
 
         return proc

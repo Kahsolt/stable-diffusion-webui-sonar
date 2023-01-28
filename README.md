@@ -123,7 +123,14 @@ How hard ref_img guidance works:
   - ref_stop_step: (float)
     - sampling step range which enables the ref guidance mechanism (kind of scheduling)
     - if > 1, parse as step number; if <= 1, parse as percentage of total steps
-
+- upscale_*
+  - upscaler: (categorical)
+  - ratio: (float)
+  - width: (int)
+  - height: (int)
+    - if `width==height==0`, upscale by the specified ratio
+    - if `width==0 or height==0`, the zero one will be auto calculated to match the non-zero one, keeping the aspect-raio
+    - if `width!=0 and height!=0`, upscale while keeping the aspect-raio to cover the target size, then crop the excess if necessary
 
 ### Developers
 
