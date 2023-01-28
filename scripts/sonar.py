@@ -12,9 +12,7 @@ from tqdm.auto import trange
 
 from modules import scripts, devices
 from modules.shared import state, opts
-from modules.processing import *
 from modules.sd_samplers import *
-KDiffusionSampler, CFGDenoiser, SamplerData, setup_img2img_steps, inspect 
 from modules.prompt_parser import ScheduledPromptConditioning, MulticondLearnedConditioning
 from k_diffusion.sampling import to_d, get_ancestral_step
 from ldm.models.diffusion.ddpm import LatentDiffusion
@@ -56,21 +54,20 @@ settings = {
 
 # ↓↓↓ the following is modified from 'modules/processing.py' ↓↓↓
 
+from modules.processing import *
+
 def process_images(p: StableDiffusionProcessing) -> Processed:
     stored_opts = {k: opts.data[k] for k in p.override_settings.keys()}
 
     try:
         for k, v in p.override_settings.items():
             setattr(opts, k, v)
-            if k == 'sd_hypernetwork':
-                shared.reload_hypernetworks()  # make onchange call for changing hypernet
 
             if k == 'sd_model_checkpoint':
-                sd_models.reload_model_weights()  # make onchange call for changing SD model
-                p.sd_model = shared.sd_model
+                sd_models.reload_model_weights()
 
             if k == 'sd_vae':
-                sd_vae.reload_vae_weights()  # make onchange call for changing VAE
+                sd_vae.reload_vae_weights()
 
         res = process_images_inner(p)
 
@@ -79,9 +76,11 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         if p.override_settings_restore_afterwards:
             for k, v in stored_opts.items():
                 setattr(opts, k, v)
-                if k == 'sd_hypernetwork': shared.reload_hypernetworks()
-                if k == 'sd_model_checkpoint': sd_models.reload_model_weights()
-                if k == 'sd_vae': sd_vae.reload_vae_weights()
+                if k == 'sd_model_checkpoint':
+                    sd_models.reload_model_weights()
+
+                if k == 'sd_vae':
+                    sd_vae.reload_vae_weights()
 
     return res
 
@@ -126,12 +125,10 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     def infotext(iteration=0, position_in_batch=0):
         return create_infotext(p, p.all_prompts, p.all_seeds, p.all_subseeds, comments, iteration, position_in_batch)
 
-    with open(os.path.join(shared.script_path, "params.txt"), "w", encoding="utf8") as file:
-        processed = Processed(p, [], p.seed, "")
-        file.write(processed.infotext(p, 0))
-
     if os.path.exists(cmd_opts.embeddings_dir) and not p.do_not_reload_embeddings:
         model_hijack.embedding_db.load_textual_inversion_embeddings()
+
+    _, extra_network_data = extra_networks.parse_prompts(p.all_prompts[0:1])
 
     if p.scripts is not None:
         p.scripts.process(p)
@@ -166,6 +163,17 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         with devices.autocast():
             p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
 
+            # for OSX, loading the model during sampling changes the generated picture, so it is loaded here
+            if shared.opts.live_previews_enable and opts.show_progress_type == "Approx NN":
+                sd_vae_approx.model()
+
+            if not p.disable_extra_networks:
+                extra_networks.activate(p, extra_network_data)
+
+        with open(os.path.join(shared.script_path, "params.txt"), "w", encoding="utf8") as file:
+            processed = Processed(p, [], p.seed, "")
+            file.write(processed.infotext(p, 0))
+
         if state.job_count == -1:
             state.job_count = p.n_iter
 
@@ -186,6 +194,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             if len(prompts) == 0:
                 break
 
+            prompts, _ = extra_networks.parse_prompts(prompts)
+
             if p.scripts is not None:
                 p.scripts.process_batch(p, batch_number=n, prompts=prompts, seeds=seeds, subseeds=subseeds)
 
@@ -199,14 +209,17 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             if p.n_iter > 1:
                 shared.state.job = f"Batch {n+1} out of {p.n_iter}"
 
-            with devices.autocast():
+            with devices.without_autocast() if devices.unet_needs_upcast else devices.autocast():
                 # NOTE: pointing to my wrapper
                 if   isinstance(p, StableDiffusionProcessingTxt2Img): sample_func = StableDiffusionProcessingTxt2Img_sample
                 elif isinstance(p, StableDiffusionProcessingImg2Img): sample_func = StableDiffusionProcessingImg2Img_sample
                 else: raise ValueError
                 samples_ddim = sample_func(p, conditioning=c, unconditional_conditioning=uc, seeds=seeds, subseeds=subseeds, subseed_strength=p.subseed_strength, prompts=prompts)
-            
+
             x_samples_ddim = [decode_first_stage(p.sd_model, samples_ddim[i:i+1].to(dtype=devices.dtype_vae))[0].cpu() for i in range(samples_ddim.size(0))]
+            for x in x_samples_ddim:
+                devices.test_for_nans(x, "vae")
+
             x_samples_ddim = torch.stack(x_samples_ddim).float()
             x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
 
@@ -234,6 +247,11 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                     devices.torch_gc()
 
                 image = Image.fromarray(x_sample)
+
+                if p.scripts is not None:
+                    pp = scripts.PostprocessImageArgs(image)
+                    p.scripts.postprocess_image(p, pp)
+                    image = pp.image
 
                 if p.color_corrections is not None and i < len(p.color_corrections):
                     if opts.save and not p.do_not_save_samples and opts.save_images_before_color_correction:
@@ -275,6 +293,9 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             if opts.grid_save:
                 images.save_image(grid, p.outpath_grids, "grid", p.all_seeds[0], p.all_prompts[0], opts.grid_format, info=infotext(), short_filename=not opts.grid_extended_filename, p=p, grid=True)
+
+    if not p.disable_extra_networks:
+        extra_networks.deactivate(p, extra_network_data)
 
     devices.torch_gc()
 
@@ -353,7 +374,6 @@ def StableDiffusionProcessingTxt2Img_sample(self:StableDiffusionProcessingTxt2Im
 
     shared.state.nextjob()
 
-    # NOTE: hijack the sampler~
     self.sampler = create_sampler(self.sd_model)
 
     samples = samples[:, :, self.truncate_y//2:samples.shape[2]-(self.truncate_y+1)//2, self.truncate_x//2:samples.shape[3]-(self.truncate_x+1)//2]

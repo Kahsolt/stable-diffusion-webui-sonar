@@ -44,6 +44,7 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 
 ⚪ Fixups
 
+- 2023/01/28: keep up with webui's updates of extra-networks
 - 2023/01/12: fix issue #2 with webui's updates (error `AttributeError: 'Options' object has no attribute 'filter_nsfw'`)
 - 2023/01/03: fix issue #1 with webui's updates (error `AttributeError: 'StableDiffusionProcessingTxt2Img' object has no attribute 'firstphase_height'`)
 
@@ -54,12 +55,40 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 
 ![momentum.png](img/momentum.png)
 
+How momentum works:
+
+- Basically at each sample step, the denoiser will modify the latent image by a `dx`
+  - using [sd-extension-steps-animation](https://github.com/vladmandic/sd-extension-steps-animation) you can inspect into the sampling process
+  - this `dx` is also to some extent understood as `gradient` or `differential`
+- And the sigma schedule (like `karras`) controls denoiser's step-size (i.e. magnitude of `dx`), to assure the process annealing so that the final output converges at some place
+  - see [damping signal](https://en.wikipedia.org/wiki/Damping#Damped_sine_wave)
+- Momentum mechanism memorizes kind of history of `dx`, and is used to increase (when `pos`) or reduce (when `neg`) the damping magitude
+  - a bit like the `LMS/PLMS` sampler, but works on gradient level
+  - by this way, you can anneal your noisy latent image to some other places nearby (works like subseed...)
+  - by this way, **you could retain some details which is normally taken as noise and removed by a denoiser** (subseed might not be capable for this)
+
+Parameter tuning reference:
+
+- set `Momentum (current)` to `1`, this will give you an image without momentum mechanism
+- tune `Momentum (current)` and `Momentum (history)` to see what will vary...
+  - `Momentum (current)` is weighted-accumulated 1st-order gradient, usually should `>= 0.85`
+  - `Momentum (history)` is weighted-accumulated of all higher-than-1st-order gradients 
+  - probably keep `Momentum sign = pos` and `Momentum history init = zero`
+  - because other parameters are pure experimental and I could not explain in brief... 🤣
+
 
 ⚪ ref_img guide
 
 ![ref.png](img/ref.png)
 
 ⚠ Above images are not intented to show the best results, but showing the trendency. You shall carefully tune these hparams all by yourself to get good results. 🤣
+
+How hard ref_img guidance works:
+
+- **After** each denoise step, make an extra step towards the given image in latent space
+- It is a kind of shallow fusion, thus ...
+  - in fact needs a carefully step-size scheduling, but not implemented yet :(
+  - when the given condition (the digested prompts) mismatches the ref_img very much, they will fight, and the canvas would be again and again overwriten, giving bad final results 🤣
 
 
 ### Options
