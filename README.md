@@ -44,9 +44,10 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 
 ⚪ Fixups
 
+- 2023/01/28: keep up with webui's updates (issue #4: `NameError: name 'CFGDenoiser' is not defined`)
 - 2023/01/28: keep up with webui's updates of extra-networks
-- 2023/01/12: fix issue #2 with webui's updates (error `AttributeError: 'Options' object has no attribute 'filter_nsfw'`)
-- 2023/01/03: fix issue #1 with webui's updates (error `AttributeError: 'StableDiffusionProcessingTxt2Img' object has no attribute 'firstphase_height'`)
+- 2023/01/12: keep up with webui's updates (issue #2: `AttributeError: 'Options' object has no attribute 'filter_nsfw'`)
+- 2023/01/03: keep up with webui's updates (issue #1: `AttributeError: 'StableDiffusionProcessingTxt2Img' object has no attribute 'firstphase_height'`)
 
 
 ### Examples

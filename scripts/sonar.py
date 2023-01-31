@@ -3,6 +3,7 @@ import random
 from PIL import Image
 from typing import List, Tuple
 from pprint import pprint as pp
+import inspect
 
 import gradio as gr
 import torch
@@ -13,7 +14,8 @@ from tqdm.auto import trange
 from modules import scripts, devices
 from modules.script_callbacks import on_before_image_saved, remove_callbacks_for_function, ImageSaveParams
 from modules.shared import state, opts, sd_upscalers
-from modules.sd_samplers import *
+from modules.sd_samplers_common import setup_img2img_steps, SamplerData
+from modules.sd_samplers_kdiffusion import CFGDenoiser, KDiffusionSampler
 from modules.ui import gr_show
 from modules.prompt_parser import ScheduledPromptConditioning, MulticondLearnedConditioning
 from modules.images import resize_image
