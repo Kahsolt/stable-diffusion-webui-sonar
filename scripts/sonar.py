@@ -1,6 +1,6 @@
-import os
 import random
 from PIL import Image
+from PIL.Image import Image as PILImage
 from typing import List, Tuple
 from pprint import pprint as pp
 import inspect
@@ -65,256 +65,6 @@ settings = {
 # ↓↓↓ the following is modified from 'modules/processing.py' ↓↓↓
 
 from modules.processing import *
-
-def process_images(p: StableDiffusionProcessing) -> Processed:
-    stored_opts = {k: opts.data[k] for k in p.override_settings.keys()}
-
-    try:
-        for k, v in p.override_settings.items():
-            setattr(opts, k, v)
-
-            if k == 'sd_model_checkpoint':
-                sd_models.reload_model_weights()
-
-            if k == 'sd_vae':
-                sd_vae.reload_vae_weights()
-
-        res = process_images_inner(p)
-
-    finally:
-        # restore opts to original state
-        if p.override_settings_restore_afterwards:
-            for k, v in stored_opts.items():
-                setattr(opts, k, v)
-                if k == 'sd_model_checkpoint':
-                    sd_models.reload_model_weights()
-
-                if k == 'sd_vae':
-                    sd_vae.reload_vae_weights()
-
-    return res
-
-def process_images_inner(p: StableDiffusionProcessing) -> Processed:
-    """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
-
-    if type(p.prompt) == list:
-        assert(len(p.prompt) > 0)
-    else:
-        assert p.prompt is not None
-
-    devices.torch_gc()
-
-    seed = get_fixed_seed(p.seed)
-    subseed = get_fixed_seed(p.subseed)
-
-    modules.sd_hijack.model_hijack.apply_circular(p.tiling)
-    modules.sd_hijack.model_hijack.clear_comments()
-
-    comments = {}
-
-    if type(p.prompt) == list:
-        p.all_prompts = [shared.prompt_styles.apply_styles_to_prompt(x, p.styles) for x in p.prompt]
-    else:
-        p.all_prompts = p.batch_size * p.n_iter * [shared.prompt_styles.apply_styles_to_prompt(p.prompt, p.styles)]
-
-    if type(p.negative_prompt) == list:
-        p.all_negative_prompts = [shared.prompt_styles.apply_negative_styles_to_prompt(x, p.styles) for x in p.negative_prompt]
-    else:
-        p.all_negative_prompts = p.batch_size * p.n_iter * [shared.prompt_styles.apply_negative_styles_to_prompt(p.negative_prompt, p.styles)]
-
-    if type(seed) == list:
-        p.all_seeds = seed
-    else:
-        p.all_seeds = [int(seed) + (x if p.subseed_strength == 0 else 0) for x in range(len(p.all_prompts))]
-
-    if type(subseed) == list:
-        p.all_subseeds = subseed
-    else:
-        p.all_subseeds = [int(subseed) + x for x in range(len(p.all_prompts))]
-
-    def infotext(iteration=0, position_in_batch=0):
-        return create_infotext(p, p.all_prompts, p.all_seeds, p.all_subseeds, comments, iteration, position_in_batch)
-
-    if os.path.exists(cmd_opts.embeddings_dir) and not p.do_not_reload_embeddings:
-        model_hijack.embedding_db.load_textual_inversion_embeddings()
-
-    _, extra_network_data = extra_networks.parse_prompts(p.all_prompts[0:1])
-
-    if p.scripts is not None:
-        p.scripts.process(p)
-
-    infotexts = []
-    output_images = []
-
-    cached_uc = [None, None]
-    cached_c = [None, None]
-
-    def get_conds_with_caching(function, required_prompts, steps, cache):
-        """
-        Returns the result of calling function(shared.sd_model, required_prompts, steps)
-        using a cache to store the result if the same arguments have been used before.
-
-        cache is an array containing two elements. The first element is a tuple
-        representing the previously used arguments, or None if no arguments
-        have been used before. The second element is where the previously
-        computed result is stored.
-        """
-
-        if cache[0] is not None and (required_prompts, steps) == cache[0]:
-            return cache[1]
-
-        with devices.autocast():
-            cache[1] = function(shared.sd_model, required_prompts, steps)
-
-        cache[0] = (required_prompts, steps)
-        return cache[1]
-
-    with torch.no_grad(), p.sd_model.ema_scope():
-        with devices.autocast():
-            p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
-
-            # for OSX, loading the model during sampling changes the generated picture, so it is loaded here
-            if shared.opts.live_previews_enable and opts.show_progress_type == "Approx NN":
-                sd_vae_approx.model()
-
-            if not p.disable_extra_networks:
-                extra_networks.activate(p, extra_network_data)
-
-        with open(os.path.join(shared.script_path, "params.txt"), "w", encoding="utf8") as file:
-            processed = Processed(p, [], p.seed, "")
-            file.write(processed.infotext(p, 0))
-
-        if state.job_count == -1:
-            state.job_count = p.n_iter
-
-        for n in range(p.n_iter):
-            p.iteration = n
-
-            if state.skipped:
-                state.skipped = False
-
-            if state.interrupted:
-                break
-
-            prompts = p.all_prompts[n * p.batch_size:(n + 1) * p.batch_size]
-            negative_prompts = p.all_negative_prompts[n * p.batch_size:(n + 1) * p.batch_size]
-            seeds = p.all_seeds[n * p.batch_size:(n + 1) * p.batch_size]
-            subseeds = p.all_subseeds[n * p.batch_size:(n + 1) * p.batch_size]
-
-            if len(prompts) == 0:
-                break
-
-            prompts, _ = extra_networks.parse_prompts(prompts)
-
-            if p.scripts is not None:
-                p.scripts.process_batch(p, batch_number=n, prompts=prompts, seeds=seeds, subseeds=subseeds)
-
-            uc = get_conds_with_caching(prompt_parser.get_learned_conditioning, negative_prompts, p.steps, cached_uc)
-            c = get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, prompts, p.steps, cached_c)
-
-            if len(model_hijack.comments) > 0:
-                for comment in model_hijack.comments:
-                    comments[comment] = 1
-
-            if p.n_iter > 1:
-                shared.state.job = f"Batch {n+1} out of {p.n_iter}"
-
-            with devices.without_autocast() if devices.unet_needs_upcast else devices.autocast():
-                # NOTE: pointing to my wrapper
-                if   isinstance(p, StableDiffusionProcessingTxt2Img): sample_func = StableDiffusionProcessingTxt2Img_sample
-                elif isinstance(p, StableDiffusionProcessingImg2Img): sample_func = StableDiffusionProcessingImg2Img_sample
-                else: raise ValueError
-                samples_ddim = sample_func(p, conditioning=c, unconditional_conditioning=uc, seeds=seeds, subseeds=subseeds, subseed_strength=p.subseed_strength, prompts=prompts)
-
-            x_samples_ddim = [decode_first_stage(p.sd_model, samples_ddim[i:i+1].to(dtype=devices.dtype_vae))[0].cpu() for i in range(samples_ddim.size(0))]
-            for x in x_samples_ddim:
-                devices.test_for_nans(x, "vae")
-
-            x_samples_ddim = torch.stack(x_samples_ddim).float()
-            x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-
-            del samples_ddim
-
-            if shared.cmd_opts.lowvram or shared.cmd_opts.medvram:
-                lowvram.send_everything_to_cpu()
-
-            devices.torch_gc()
-
-            if p.scripts is not None:
-                p.scripts.postprocess_batch(p, x_samples_ddim, batch_number=n)
-
-            for i, x_sample in enumerate(x_samples_ddim):
-                x_sample = 255. * np.moveaxis(x_sample.cpu().numpy(), 0, 2)
-                x_sample = x_sample.astype(np.uint8)
-
-                if p.restore_faces:
-                    if opts.save and not p.do_not_save_samples and opts.save_images_before_face_restoration:
-                        images.save_image(Image.fromarray(x_sample), p.outpath_samples, "", seeds[i], prompts[i], opts.samples_format, info=infotext(n, i), p=p, suffix="-before-face-restoration")
-
-                    devices.torch_gc()
-
-                    x_sample = modules.face_restoration.restore_faces(x_sample)
-                    devices.torch_gc()
-
-                image = Image.fromarray(x_sample)
-
-                if p.scripts is not None:
-                    pp = scripts.PostprocessImageArgs(image)
-                    p.scripts.postprocess_image(p, pp)
-                    image = pp.image
-
-                if p.color_corrections is not None and i < len(p.color_corrections):
-                    if opts.save and not p.do_not_save_samples and opts.save_images_before_color_correction:
-                        image_without_cc = apply_overlay(image, p.paste_to, i, p.overlay_images)
-                        images.save_image(image_without_cc, p.outpath_samples, "", seeds[i], prompts[i], opts.samples_format, info=infotext(n, i), p=p, suffix="-before-color-correction")
-                    image = apply_color_correction(p.color_corrections[i], image)
-
-                image = apply_overlay(image, p.paste_to, i, p.overlay_images)
-
-                if opts.samples_save and not p.do_not_save_samples:
-                    images.save_image(image, p.outpath_samples, "", seeds[i], prompts[i], opts.samples_format, info=infotext(n, i), p=p)
-
-                text = infotext(n, i)
-                infotexts.append(text)
-                if opts.enable_pnginfo:
-                    image.info["parameters"] = text
-                output_images.append(image)
-
-            del x_samples_ddim
-
-            devices.torch_gc()
-
-            state.nextjob()
-
-        p.color_corrections = None
-
-        index_of_first_image = 0
-        unwanted_grid_because_of_img_count = len(output_images) < 2 and opts.grid_only_if_multiple
-        if (opts.return_grid or opts.grid_save) and not p.do_not_save_grid and not unwanted_grid_because_of_img_count:
-            grid = images.image_grid(output_images, p.batch_size)
-
-            if opts.return_grid:
-                text = infotext()
-                infotexts.insert(0, text)
-                if opts.enable_pnginfo:
-                    grid.info["parameters"] = text
-                output_images.insert(0, grid)
-                index_of_first_image = 1
-
-            if opts.grid_save:
-                images.save_image(grid, p.outpath_grids, "grid", p.all_seeds[0], p.all_prompts[0], opts.grid_format, info=infotext(), short_filename=not opts.grid_extended_filename, p=p, grid=True)
-
-    if not p.disable_extra_networks:
-        extra_networks.deactivate(p, extra_network_data)
-
-    devices.torch_gc()
-
-    res = Processed(p, output_images, p.all_seeds[0], infotext(), comments="".join(["\n\n" + x for x in comments]), subseed=p.all_subseeds[0], index_of_first_image=index_of_first_image, infotexts=infotexts)
-
-    if p.scripts is not None:
-        p.scripts.postprocess(p, res)
-
-    return res
 
 def StableDiffusionProcessingTxt2Img_sample(self:StableDiffusionProcessingTxt2Img, conditioning, unconditional_conditioning, seeds, subseeds, subseed_strength, prompts):
     # NOTE: hijack the sampler~
@@ -487,7 +237,7 @@ def sample_naive_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, cal
     momentum_hist_init = settings['momentum_hist_init']
     ref_hgf            = settings['ref_hgf']
     ref_meth           = settings['ref_meth']
-    ref_img            = settings['ref_img']
+    ref_img: PILImage  = settings['ref_img']
     ref_min_step       = settings['ref_min_step']
     ref_max_step       = settings['ref_max_step']
 
@@ -499,8 +249,7 @@ def sample_naive_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, cal
 
     # prepare ref_img latent
     if ref_img is not None:
-        img = Image.open(ref_img).convert('RGB')
-        x_ref = torch.from_numpy(np.asarray(img)).moveaxis(2, 0)    # [C=3, H, W]
+        x_ref = torch.from_numpy(np.asarray(ref_img)).moveaxis(2, 0)    # [C=3, H, W]
         x_ref = (x_ref / 255) * 2 - 1
         x_ref = x_ref.unsqueeze(dim=0).expand(x.shape[0], -1, -1, -1)  # [B, C=3, H, W]
         x_ref = x_ref.to(sd_model.first_stage_model.device)
@@ -846,58 +595,69 @@ class Script(scripts.Script):
         return "Wrapped samplers with tricks to optimize prompt condition and image latent for better image quality"
 
     def show(self, is_img2img):
-        return True
+        return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        sampler = gr.Radio(label='Base Sampler', value=lambda: DEFAULT_SAMPLER, choices=CHOICE_SAMPLER)
+        with gr.Accordion(label='Sonar sampler', open=False):
+            with gr.Row():
+                is_enable = gr.Checkbox(label='Enable', value=lambda: False)
+            with gr.Row():
+                sampler = gr.Radio(label='Base Sampler', value=lambda: DEFAULT_SAMPLER, choices=CHOICE_SAMPLER)
 
-        with gr.Group() as tab_momentum:
-            with gr.Row(variant='compact'):
-                momentum      = gr.Slider(label='Momentum (current)', minimum=0.75, maximum=1.0, value=lambda: DEFAULT_MOMENTUM)
-                momentum_hist = gr.Slider(label='Momentum (history)', minimum=0.0,  maximum=1.0, value=lambda: DEFAULT_MOMENTUM_HIST)
-            with gr.Row(variant='compact'):
-                momentum_sign      = gr.Radio(label='Momentum sign',         value=lambda: DEFAULT_MOMENTUM_SIGN,      choices=CHOICE_MOMENTUM_SIGN)
-                momentum_hist_init = gr.Radio(label='Momentum history init', value=lambda: DEFAULT_MOMENTUM_HIST_INIT, choices=CHOICE_MOMENTUM_HIST_INIT)
-        
-        with gr.Group(visible=False) as tab_file:
-            with gr.Row(variant='compact'):
-                ref_meth = gr.Radio(label='Ref guide step method', value=lambda: DEFAULT_REF_METH, choices=CHOICE_REF_METH)
-                ref_hgf = gr.Slider(label='Ref guide factor', value=lambda: DEFAULT_REF_HGF, minimum=-1, maximum=1, step=0.001)
-                ref_min_step = gr.Number(label='Ref start step', value=lambda: DEFAULT_REF_MIN_STEP)
-                ref_max_step = gr.Number(label='Ref stop step', value=lambda: DEFAULT_REF_MAX_STEP)
-            with gr.Row(variant='compact'):
-                ref_img = gr.File(label='Reference image file', interactive=True)
+            with gr.Group() as tab_momentum:
+                with gr.Row(variant='compact'):
+                    momentum      = gr.Slider(label='Momentum (current)', minimum=0.75, maximum=1.0, value=lambda: DEFAULT_MOMENTUM)
+                    momentum_hist = gr.Slider(label='Momentum (history)', minimum=0.0,  maximum=1.0, value=lambda: DEFAULT_MOMENTUM_HIST)
+                with gr.Row(variant='compact'):
+                    momentum_sign      = gr.Radio(label='Momentum sign',         value=lambda: DEFAULT_MOMENTUM_SIGN,      choices=CHOICE_MOMENTUM_SIGN)
+                    momentum_hist_init = gr.Radio(label='Momentum history init', value=lambda: DEFAULT_MOMENTUM_HIST_INIT, choices=CHOICE_MOMENTUM_HIST_INIT)
 
-        def swith_sampler(sampler:str):
-            SHOW_TABS = {
-                # (show_momt, show_file)
-                'Euler a': (True, False),
-                'Euler':   (True, False),
-                'Naive':   (True, True),
-            }
-            show_momt, show_file = SHOW_TABS[sampler]
-            return [
-                gr_show(show_momt),
-                gr_show(show_file),
-            ]
-        sampler.change(swith_sampler, inputs=[sampler], outputs=[tab_momentum, tab_file])
+            with gr.Group(visible=False) as tab_file:
+                with gr.Row(variant='compact'):
+                    ref_meth = gr.Radio(label='Ref guide step method', value=lambda: DEFAULT_REF_METH, choices=CHOICE_REF_METH)
+                    ref_hgf = gr.Slider(label='Ref guide factor', value=lambda: DEFAULT_REF_HGF, minimum=-1, maximum=1, step=0.001)
+                    ref_min_step = gr.Number(label='Ref start step', value=lambda: DEFAULT_REF_MIN_STEP)
+                    ref_max_step = gr.Number(label='Ref stop step', value=lambda: DEFAULT_REF_MAX_STEP)
+                with gr.Row(variant='compact'):
+                    ref_img = gr.File(label='Reference image file', interactive=True)
 
-        with gr.Row(variant='compact'):
-            upscale_meth   = gr.Dropdown(label='Upscaler', value=lambda: DEFAULT_UPSCALE_METH,  choices=CHOICE_UPSCALER)
-            upscale_ratio  = gr.Slider  (label='Upscale ratio',  value=lambda: DEFAULT_UPSCALE_RATIO, minimum=1.0, maximum=4.0, step=0.1)
-            upscale_width  = gr.Slider  (label='Upscale width',  value=lambda: DEFAULT_UPSCALE_W, minimum=0, maximum=2048, step=8)
-            upscale_height = gr.Slider  (label='Upscale height', value=lambda: DEFAULT_UPSCALE_H, minimum=0, maximum=2048, step=8)
+            def swith_sampler(sampler:str):
+                SHOW_TABS = {
+                    # (show_momt, show_file)
+                    'Euler a': (True, False),
+                    'Euler':   (True, False),
+                    'Naive':   (True, True),
+                }
+                show_momt, show_file = SHOW_TABS[sampler]
+                return [
+                    gr_show(show_momt),
+                    gr_show(show_file),
+                ]
+            sampler.change(swith_sampler, inputs=[sampler], outputs=[tab_momentum, tab_file])
 
-        return [sampler, 
+            with gr.Row(variant='compact'):
+                upscale_meth   = gr.Dropdown(label='Upscaler', value=lambda: DEFAULT_UPSCALE_METH,  choices=CHOICE_UPSCALER)
+                upscale_ratio  = gr.Slider  (label='Upscale ratio',  value=lambda: DEFAULT_UPSCALE_RATIO, minimum=1.0, maximum=4.0, step=0.1)
+                upscale_width  = gr.Slider  (label='Upscale width',  value=lambda: DEFAULT_UPSCALE_W, minimum=0, maximum=2048, step=8)
+                upscale_height = gr.Slider  (label='Upscale height', value=lambda: DEFAULT_UPSCALE_H, minimum=0, maximum=2048, step=8)
+
+        return [is_enable, sampler, 
                 momentum, momentum_hist, momentum_hist_init, momentum_sign, 
                 ref_meth, ref_hgf, ref_min_step, ref_max_step, ref_img,
                 upscale_meth, upscale_ratio, upscale_width, upscale_height]
-    
-    def run(self, p:StableDiffusionProcessing, sampler:str, 
+
+    def process(self, p:StableDiffusionProcessing, is_enable:bool, sampler:str, 
             momentum:float, momentum_hist:float, momentum_hist_init:str, momentum_sign:str,
             ref_meth:str, ref_hgf:float, ref_min_step:float, ref_max_step:float, ref_img:object,
             upscale_meth:str, upscale_ratio:float, upscale_width:int, upscale_height:int):
-        
+
+        if not is_enable: return
+
+        # type convert
+        if ref_img is not None:
+            ref_img = Image.open(ref_img).convert('RGB')
+            ref_img = resize_image(1, ref_img, p.width, p.height)
+
         # save settings to global
         settings['sampler']            = sampler
         settings['momentum']           = momentum
@@ -912,16 +672,22 @@ class Script(scripts.Script):
 
         #pp(settings)
 
-        enabled, (tgt_w, tgt_h) = get_upscale_resolution(p, upscale_meth, upscale_ratio, upscale_width, upscale_height)
-        if enabled: print(f'>> upscale: ({p.width}, {p.height}) => ({tgt_w}, {tgt_h})')
+        enable_upscale, (tgt_w, tgt_h) = get_upscale_resolution(p, upscale_meth, upscale_ratio, upscale_width, upscale_height)
+        if enable_upscale: print(f'>> upscale: ({p.width}, {p.height}) => ({tgt_w}, {tgt_h})')
 
         def save_image_hijack(params:ImageSaveParams):
-            if not enabled: return
-            params.image = resize_image(1, params.image, tgt_w, tgt_h, upscaler_name=upscale_meth)
+            if enable_upscale:
+                params.image = resize_image(1, params.image, tgt_w, tgt_h, upscaler_name=upscale_meth)
 
-        state.job_count = p.n_iter * p.batch_size
         on_before_image_saved(save_image_hijack)
-        proc = process_images(p)
-        remove_callbacks_for_function(save_image_hijack)
 
-        return proc
+        self.sample_saved = p.sample
+        if isinstance(p, StableDiffusionProcessingTxt2Img):
+            p.sample = lambda *args, **kwargs: StableDiffusionProcessingTxt2Img_sample(p, *args, **kwargs)
+        elif isinstance(p, StableDiffusionProcessingImg2Img):
+            p.sample = lambda *args, **kwargs: StableDiffusionProcessingImg2Img_sample(p, *args, **kwargs)
+
+    def postprocess(self, p: StableDiffusionProcessing, processed, is_enable:bool, *args):
+        if not is_enable: return
+
+        p.sample = self.sample_saved
