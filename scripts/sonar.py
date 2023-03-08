@@ -34,7 +34,7 @@ if 'global const':
     DEFAULT_MOMENTUM_HIST_INIT = 'zero'
     DEFAULT_MOMENTUM_SIGN      = 'pos'
     DEFAULT_REF_METH           = 'linear'
-    DEFAULT_REF_HGF            = 0.01
+    DEFAULT_REF_HGF            = 0.2
     DEFAULT_REF_MIN_STEP       = 0.0
     DEFAULT_REF_MAX_STEP       = 0.75
     DEFAULT_REF_IMG            = None
@@ -646,7 +646,7 @@ class Script(scripts.Script):
         with gr.Group(visible=False) as tab_file:
             with gr.Row(variant='compact'):
                 ref_meth = gr.Radio(label='Ref guide step method', value=lambda: DEFAULT_REF_METH, choices=CHOICE_REF_METH)
-                ref_hgf = gr.Slider(label='Ref guide factor', value=lambda: DEFAULT_REF_HGF, minimum=-1, maximum=1, step=0.001)
+                ref_hgf = gr.Slider(label='Ref guide factor', value=lambda: DEFAULT_REF_HGF, minimum=0, maximum=1, step=0.01)
                 ref_min_step = gr.Number(label='Ref start step', value=lambda: DEFAULT_REF_MIN_STEP)
                 ref_max_step = gr.Number(label='Ref stop step', value=lambda: DEFAULT_REF_MAX_STEP)
             with gr.Row(variant='compact'):
@@ -709,7 +709,7 @@ class Script(scripts.Script):
         settings['ref_meth']           = ref_meth
         settings['ref_min_step']       = int(ref_min_step) if ref_min_step > 1 else round(ref_min_step * p.steps)
         settings['ref_max_step']       = int(ref_max_step) if ref_max_step > 1 else round(ref_max_step * p.steps)
-        settings['ref_hgf']            = ref_hgf
+        settings['ref_hgf']            = ref_hgf / 10.0
         settings['ref_img']            = ref_img
 
         #pp(settings)
