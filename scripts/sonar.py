@@ -46,6 +46,27 @@ CHOICE_UPSCALER           = [x.name for x in sd_upscalers]
 #FEAT_MAP_PATH = 'C:\sd-webui_featmaps'
 FEAT_MAP_PATH = None
 
+def show_featmap(x, title=''):
+    if not FEAT_MAP_PATH: return
+
+    import os
+    import matplotlib.pyplot as plt
+    os.makedirs(FEAT_MAP_PATH, exist_ok=True)
+
+    x_np = x[0].cpu().numpy()    # [C=4, H=64, W=64]
+    x_np_abs = np.abs(x_np)
+    print(f'[{title}]')
+    print('   x_np:',     x_np    .max(), x_np    .min(), x_np    .mean(), x_np    .std())
+    print('   x_np_abs:', x_np_abs.max(), x_np_abs.min(), x_np_abs.mean(), x_np_abs.std())
+    for i in range(4):
+        plt.axis('off')
+        plt.subplot(2, 2, i+1)
+        plt.imshow(x_np[i])
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.savefig(os.path.join(FEAT_MAP_PATH, f'{title}.png'))
+
+
 # the current setting (the wrappers are too deep, we pass it by global var)
 settings = {
     'sampler':            DEFAULT_SAMPLER,
@@ -172,26 +193,6 @@ def StableDiffusionProcessingImg2Img_sample(self:StableDiffusionProcessingImg2Im
 
 
 # ↓↓↓ the following is modified from 'k_diffusion/sampling.py' ↓↓↓
-
-def show_featmap(x, title=''):
-    if not FEAT_MAP_PATH: return
-
-    import os
-    import matplotlib.pyplot as plt
-    os.makedirs(FEAT_MAP_PATH, exist_ok=True)
-
-    x_np = x[0].cpu().numpy()    # [C=4, H=64, W=64]
-    x_np_abs = np.abs(x_np)
-    print(f'[{title}]')
-    print('   x_np:',     x_np    .max(), x_np    .min(), x_np    .mean(), x_np    .std())
-    print('   x_np_abs:', x_np_abs.max(), x_np_abs.min(), x_np_abs.mean(), x_np_abs.std())
-    for i in range(4):
-        plt.axis('off')
-        plt.subplot(2, 2, i+1)
-        plt.imshow(x_np[i])
-    plt.suptitle(title)
-    plt.tight_layout()
-    plt.savefig(os.path.join(FEAT_MAP_PATH, f'{title}.png'))
 
 @torch.no_grad()
 def sample_naive(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, callback=None, *args):
