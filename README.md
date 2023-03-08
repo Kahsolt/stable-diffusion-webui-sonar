@@ -117,11 +117,11 @@ How hard ref_img guidance works:
   - momentum_hist: (float), momentum of memorized difference history
     - the larger, approving current history
     - the smaller, approving former histories
-  - momentum_hist_init: (float), init value of history, aka. the genesis
+  - momentum_hist_init: (categorical), init value of history, aka. the genesis (experimental)
     - `zero`: use the first denoised latent
     - `rand_init`: just use the init latent noise 
     - `rand_new`: use a new guassian noise
-  - momentum_sign: (categorical), momentum direction to apply correction
+  - momentum_sign: (categorical), momentum direction to apply correction (experimental)
     - `pos`: correct by direction of history momentum, affirming the history
     - `neg`: correct by opposite direction of history momentum, denying the history
     - `rand`: random choose from above at each sampling step
