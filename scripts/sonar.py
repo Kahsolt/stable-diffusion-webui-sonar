@@ -255,7 +255,7 @@ def sample_naive_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, cal
         x_ref = x_ref.unsqueeze(dim=0).expand(x.shape[0], -1, -1, -1)  # [B, C=3, H, W]
         x_ref = x_ref.to(sd_model.first_stage_model.device)
 
-        with devices.autocast():
+        with devices.without_autocast() if devices.unet_needs_upcast else devices.autocast():
             latent_ref = sd_model.get_first_stage_encoding(sd_model.encode_first_stage(x_ref))     # [B, C=4, H=64, W=64]
 
             avg_s = latent_ref.mean(dim=[2, 3], keepdim=True)
@@ -572,6 +572,7 @@ class KDiffusionSamplerHijack(KDiffusionSampler):
         return samples
 
 # ↑↑↑ the above is modified from 'modules/sd_samplers.py' ↑↑↑
+
 
 def get_upscale_resolution(p:StableDiffusionProcessing, upscale_meth:str, upscale_ratio:float, upscale_width:int, upscale_height:int) -> Tuple[bool, Tuple[int, int]]:
     if upscale_meth == 'None':
