@@ -22,25 +22,31 @@ from modules.images import resize_image
 from k_diffusion.sampling import to_d, get_ancestral_step
 from ldm.models.diffusion.ddpm import LatentDiffusion
 
-DEFAULT_SAMPLER            = 'Euler a'
-DEFAULT_MOMENTUM           = 0.95
-DEFAULT_MOMENTUM_HIST      = 0.75
-DEFAULT_MOMENTUM_HIST_INIT = 'zero'
-DEFAULT_MOMENTUM_SIGN      = 'pos'
-DEFAULT_REF_METH           = 'linear'
-DEFAULT_REF_HGF            = 0.01
-DEFAULT_REF_MIN_STEP       = 0.0
-DEFAULT_REF_MAX_STEP       = 0.75
-DEFAULT_REF_IMG            = None
-DEFAULT_UPSCALE_METH       = 'Lanczos'
-DEFAULT_UPSCALE_RATIO      = 1.0
-DEFAULT_UPSCALE_W          = 0
-DEFAULT_UPSCALE_H          = 0
+if 'global const':
+    DEFAULT_ENABLE             = False
+    DEFAULT_UPSCALE            = False
+    DEFAULT_GRID_SEARCH        = False
+    DEFAULT_SAMPLER            = 'Euler a'
+    DEFAULT_MOMENTUM           = 0.95
+    DEFAULT_MOMENTUM_HIST      = 0.75
+    DEFAULT_MOMENTUM_GS        = '0.75:0.95:5'
+    DEFAULT_MOMENTUM_HIST_GS   = '0.2:0.8:5'
+    DEFAULT_MOMENTUM_HIST_INIT = 'zero'
+    DEFAULT_MOMENTUM_SIGN      = 'pos'
+    DEFAULT_REF_METH           = 'linear'
+    DEFAULT_REF_HGF            = 0.01
+    DEFAULT_REF_MIN_STEP       = 0.0
+    DEFAULT_REF_MAX_STEP       = 0.75
+    DEFAULT_REF_IMG            = None
+    DEFAULT_UPSCALE_METH       = 'Lanczos'
+    DEFAULT_UPSCALE_RATIO      = 1.0
+    DEFAULT_UPSCALE_W          = 0
+    DEFAULT_UPSCALE_H          = 0
 
-CHOICE_MOMENTUM_SIGN      = ['pos', 'neg', 'rand']
-CHOICE_MOMENTUM_HIST_INIT = ['zero', 'rand_init', 'rand_new']
-CHOICE_REF_METH           = ['linear', 'euler']
-CHOICE_UPSCALER           = [x.name for x in sd_upscalers]
+    CHOICE_MOMENTUM_SIGN      = ['pos', 'neg', 'rand']
+    CHOICE_MOMENTUM_HIST_INIT = ['zero', 'rand_init', 'rand_new']
+    CHOICE_REF_METH           = ['linear', 'euler']
+    CHOICE_UPSCALER           = [x.name for x in sd_upscalers]
 
 # debug save latent featmap (when `Euler a`)
 #FEAT_MAP_PATH = 'C:\sd-webui_featmaps'
@@ -261,7 +267,8 @@ def sample_naive_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, cal
             avg_s = latent_ref.mean(dim=[2, 3], keepdim=True)
             std_s = latent_ref.std (dim=[2, 3], keepdim=True)
             ref_img_norm = (latent_ref - avg_s) / std_s
-    
+            ref_img_norm = ref_img_norm.to(x_ref.dtype)
+
     s_in = x.new_ones([x.shape[0]])
     n_steps = len(sigmas) - 1
     for i in trange(n_steps):
@@ -368,7 +375,7 @@ def sample_euler_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, cal
             if   sign == 'pos': momentum_d = (1.0 - p) * d + p * history_d
             elif sign == 'neg': momentum_d = (1.0 + p) * d - p * history_d
             else: raise ValueError(f'unknown momentum sign {sign}')
-            
+
             # Euler method with momentum
             x = x + momentum_d * dt
 
@@ -588,6 +595,25 @@ def get_upscale_resolution(p:StableDiffusionProcessing, upscale_meth:str, upscal
         if upscale_height == 0: upscale_height = round(p.height * upscale_width  / p.width)
         return True, (upscale_width, upscale_height)
 
+def parse_gs(seq:str, def_val:float) -> List[float]:
+    seq = seq.strip()
+    if not seq: return [ def_val ]
+
+    segs = seq.split(':')
+    if len(segs) == 2:
+        start, stop = segs
+        cnt = 3
+    elif len(segs) == 3:
+        start, stop, cnt = segs
+    start = float(start)
+    stop = float(stop)
+    cnt = int(cnt)
+    assert max(start, stop) <= 1.0
+    assert min(start, stop) >= 0.0
+    assert cnt > 0
+    return np.linspace(start, stop, cnt).tolist()
+
+
 class Script(scripts.Script):
 
     def title(self):
@@ -597,68 +623,82 @@ class Script(scripts.Script):
         return "Wrapped samplers with tricks to optimize prompt condition and image latent for better image quality"
 
     def show(self, is_img2img):
-        return scripts.AlwaysVisible
+        return True
 
     def ui(self, is_img2img):
-        with gr.Accordion(label='Sonar sampler', open=False):
-            with gr.Row():
-                is_enable = gr.Checkbox(label='Enable', value=lambda: False)
-            with gr.Row():
-                sampler = gr.Radio(label='Base Sampler', value=lambda: DEFAULT_SAMPLER, choices=CHOICE_SAMPLER)
+        with gr.Row(variant='compact').style(equal_height=True):
+            sampler = gr.Radio(label='Base Sampler', value=lambda: DEFAULT_SAMPLER, choices=CHOICE_SAMPLER)
+            use_upscale = gr.Checkbox(label='Upscaling', value=lambda: DEFAULT_UPSCALE)
+            use_grid_search = gr.Checkbox(label='Grid search', value=lambda: DEFAULT_GRID_SEARCH)
 
-            with gr.Group() as tab_momentum:
-                with gr.Row(variant='compact'):
-                    momentum      = gr.Slider(label='Momentum (current)', minimum=0.75, maximum=1.0, value=lambda: DEFAULT_MOMENTUM)
-                    momentum_hist = gr.Slider(label='Momentum (history)', minimum=0.0,  maximum=1.0, value=lambda: DEFAULT_MOMENTUM_HIST)
-                with gr.Row(variant='compact'):
-                    momentum_sign      = gr.Radio(label='Momentum sign',         value=lambda: DEFAULT_MOMENTUM_SIGN,      choices=CHOICE_MOMENTUM_SIGN)
-                    momentum_hist_init = gr.Radio(label='Momentum history init', value=lambda: DEFAULT_MOMENTUM_HIST_INIT, choices=CHOICE_MOMENTUM_HIST_INIT)
-
-            with gr.Group(visible=False) as tab_file:
-                with gr.Row(variant='compact'):
-                    ref_meth = gr.Radio(label='Ref guide step method', value=lambda: DEFAULT_REF_METH, choices=CHOICE_REF_METH)
-                    ref_hgf = gr.Slider(label='Ref guide factor', value=lambda: DEFAULT_REF_HGF, minimum=-1, maximum=1, step=0.001)
-                    ref_min_step = gr.Number(label='Ref start step', value=lambda: DEFAULT_REF_MIN_STEP)
-                    ref_max_step = gr.Number(label='Ref stop step', value=lambda: DEFAULT_REF_MAX_STEP)
-                with gr.Row(variant='compact'):
-                    ref_img = gr.File(label='Reference image file', interactive=True)
-
-            def swith_sampler(sampler:str):
-                SHOW_TABS = {
-                    # (show_momt, show_file)
-                    'Euler a': (True, False),
-                    'Euler':   (True, False),
-                    'Naive':   (True, True),
-                }
-                show_momt, show_file = SHOW_TABS[sampler]
-                return [
-                    gr_show(show_momt),
-                    gr_show(show_file),
-                ]
-            sampler.change(swith_sampler, inputs=[sampler], outputs=[tab_momentum, tab_file])
-
+        with gr.Group() as tab_momentum:
+            with gr.Row(variant='compact', visible=not DEFAULT_GRID_SEARCH) as tab_m:
+                momentum      = gr.Slider(label='Momentum (current)', minimum=0.75, maximum=1.0, value=lambda: DEFAULT_MOMENTUM)
+                momentum_hist = gr.Slider(label='Momentum (history)', minimum=0.0,  maximum=1.0, value=lambda: DEFAULT_MOMENTUM_HIST)
+            with gr.Row(variant='compact', visible=DEFAULT_GRID_SEARCH) as tab_m_gs:
+                momentum_gs      = gr.Text(label='Momentum (current) search list', max_lines=1, value=lambda: DEFAULT_MOMENTUM_GS)
+                momentum_hist_gs = gr.Text(label='Momentum (history) search list', max_lines=1, value=lambda: DEFAULT_MOMENTUM_HIST_GS)
             with gr.Row(variant='compact'):
-                upscale_meth   = gr.Dropdown(label='Upscaler', value=lambda: DEFAULT_UPSCALE_METH,  choices=CHOICE_UPSCALER)
-                upscale_ratio  = gr.Slider  (label='Upscale ratio',  value=lambda: DEFAULT_UPSCALE_RATIO, minimum=1.0, maximum=4.0, step=0.1)
-                upscale_width  = gr.Slider  (label='Upscale width',  value=lambda: DEFAULT_UPSCALE_W, minimum=0, maximum=2048, step=8)
-                upscale_height = gr.Slider  (label='Upscale height', value=lambda: DEFAULT_UPSCALE_H, minimum=0, maximum=2048, step=8)
+                momentum_sign      = gr.Radio(label='Momentum sign',         value=lambda: DEFAULT_MOMENTUM_SIGN,      choices=CHOICE_MOMENTUM_SIGN)
+                momentum_hist_init = gr.Radio(label='Momentum history init', value=lambda: DEFAULT_MOMENTUM_HIST_INIT, choices=CHOICE_MOMENTUM_HIST_INIT)
+            use_grid_search.change(fn=lambda x: [gr_show(not x), gr_show(x)], inputs=use_grid_search, outputs=[tab_m, tab_m_gs])
 
-        return [is_enable, sampler, 
-                momentum, momentum_hist, momentum_hist_init, momentum_sign, 
-                ref_meth, ref_hgf, ref_min_step, ref_max_step, ref_img,
-                upscale_meth, upscale_ratio, upscale_width, upscale_height]
+        with gr.Group(visible=False) as tab_file:
+            with gr.Row(variant='compact'):
+                ref_meth = gr.Radio(label='Ref guide step method', value=lambda: DEFAULT_REF_METH, choices=CHOICE_REF_METH)
+                ref_hgf = gr.Slider(label='Ref guide factor', value=lambda: DEFAULT_REF_HGF, minimum=-1, maximum=1, step=0.001)
+                ref_min_step = gr.Number(label='Ref start step', value=lambda: DEFAULT_REF_MIN_STEP)
+                ref_max_step = gr.Number(label='Ref stop step', value=lambda: DEFAULT_REF_MAX_STEP)
+            with gr.Row(variant='compact'):
+                ref_img = gr.Image(label='Reference image file', image_mode=None, type='pil')
 
-    def process(self, p:StableDiffusionProcessing, is_enable:bool, sampler:str, 
-            momentum:float, momentum_hist:float, momentum_hist_init:str, momentum_sign:str,
-            ref_meth:str, ref_hgf:float, ref_min_step:float, ref_max_step:float, ref_img:object,
-            upscale_meth:str, upscale_ratio:float, upscale_width:int, upscale_height:int):
+        def swith_sampler(sampler:str):
+            SHOW_TABS = {
+                # (show_momt, show_file)
+                'Euler a': (True, False),
+                'Euler':   (True, False),
+                'Naive':   (True, True),
+            }
+            show_momt, show_file = SHOW_TABS[sampler]
+            return [
+                gr_show(show_momt),
+                gr_show(show_file),
+            ]
+        sampler.change(swith_sampler, inputs=[sampler], outputs=[tab_momentum, tab_file])
 
-        if not is_enable: return
+        with gr.Row(variant='compact', visible=False) as tab_upscale:
+            upscale_meth   = gr.Dropdown(label='Upscaler', value=lambda: DEFAULT_UPSCALE_METH,  choices=CHOICE_UPSCALER)
+            upscale_ratio  = gr.Slider  (label='Upscale ratio',  value=lambda: DEFAULT_UPSCALE_RATIO, minimum=1.0, maximum=4.0, step=0.1)
+            upscale_width  = gr.Slider  (label='Upscale width',  value=lambda: DEFAULT_UPSCALE_W, minimum=0, maximum=2048, step=8)
+            upscale_height = gr.Slider  (label='Upscale height', value=lambda: DEFAULT_UPSCALE_H, minimum=0, maximum=2048, step=8)
+        use_upscale.change(fn=lambda x: gr_show(x), inputs=use_upscale, outputs=tab_upscale, show_progress=False)
+
+        return [
+            use_upscale, use_grid_search, sampler, 
+            momentum, momentum_hist, momentum_gs, momentum_hist_gs, momentum_hist_init, momentum_sign, 
+            ref_meth, ref_hgf, ref_min_step, ref_max_step, ref_img,
+            upscale_meth, upscale_ratio, upscale_width, upscale_height
+        ]
+
+    def run(self, p:StableDiffusionProcessing, 
+            use_upscale:bool, use_grid_search:bool, sampler:str, 
+            momentum:float, momentum_hist:float, momentum_gs:str, momentum_hist_gs:str, momentum_hist_init:str, momentum_sign:str,
+            ref_meth:str, ref_hgf:float, ref_min_step:float, ref_max_step:float, ref_img:PILImage,
+            upscale_meth:str, upscale_ratio:float, upscale_width:int, upscale_height:int
+        ):
 
         # type convert
-        if ref_img is not None:
-            ref_img = Image.open(ref_img).convert('RGB')
-            ref_img = resize_image(1, ref_img, p.width, p.height)
+        if use_grid_search:
+            try:
+                momentums       = parse_gs(momentum_gs,      momentum)
+                momentum_hists  = parse_gs(momentum_hist_gs, momentum_hist)
+            except Exception as e:
+                return Processed(p, [], p.seed, str(e))
+        else:
+            momentums       = [momentum]
+            momentum_hists  = [momentum_hist]
+
+        if ref_img is not None: ref_img = resize_image(1, ref_img, p.width, p.height)
 
         # save settings to global
         settings['sampler']            = sampler
@@ -674,22 +714,55 @@ class Script(scripts.Script):
 
         #pp(settings)
 
-        enable_upscale, (tgt_w, tgt_h) = get_upscale_resolution(p, upscale_meth, upscale_ratio, upscale_width, upscale_height)
-        if enable_upscale: print(f'>> upscale: ({p.width}, {p.height}) => ({tgt_w}, {tgt_h})')
+        if use_upscale:
+            need_upscale, (tgt_w, tgt_h) = get_upscale_resolution(p, upscale_meth, upscale_ratio, upscale_width, upscale_height)
+            if need_upscale: print(f'>> upscale: ({p.width}, {p.height}) => ({tgt_w}, {tgt_h})')
 
         def save_image_hijack(params:ImageSaveParams):
-            if enable_upscale:
+            if use_upscale and need_upscale:
                 params.image = resize_image(1, params.image, tgt_w, tgt_h, upscaler_name=upscale_meth)
-
         on_before_image_saved(save_image_hijack)
 
         self.sample_saved = p.sample
-        if isinstance(p, StableDiffusionProcessingTxt2Img):
+        if   isinstance(p, StableDiffusionProcessingTxt2Img):
             p.sample = lambda *args, **kwargs: StableDiffusionProcessingTxt2Img_sample(p, *args, **kwargs)
         elif isinstance(p, StableDiffusionProcessingImg2Img):
             p.sample = lambda *args, **kwargs: StableDiffusionProcessingImg2Img_sample(p, *args, **kwargs)
 
-    def postprocess(self, p: StableDiffusionProcessing, processed, is_enable:bool, *args):
-        if not is_enable: return
+        n_jobs = len(momentums) * len(momentum_hists)
+        state.job_count = n_jobs
+        if use_grid_search and n_jobs > 1: print('>> grid search n_jobs:', n_jobs)
+        p.seed = get_fixed_seed(p.seed)
+        
+        info = None
+        imgs = []
+        try:
+            for m in momentums:
+                if state.interrupted: break
+                interrupted = False
+                for mh in momentum_hists:
+                    if state.interrupted: interrupted = True; break
 
-        p.sample = self.sample_saved
+                    settings['momentum']      = m
+                    settings['momentum_hist'] = mh
+                    proc = process_images(p)
+                    if info is None: info = proc.info
+                    imgs.extend(proc.images)
+                if interrupted: break
+
+            if use_grid_search and n_jobs > 1:
+                grid = images.image_grid(imgs, len(momentums))
+                grid = images.draw_grid_annotations(
+                    grid, 
+                    p.width, 
+                    p.height, 
+                    ver_texts=[[images.GridAnnotation(f'cur: {round(m, 4)}')]   for m  in momentums], 
+                    hor_texts=[[images.GridAnnotation(f'hist: {round(mh, 4)}')] for mh in momentum_hists], 
+                    margin=4,
+                )
+                imgs.insert(0, grid)
+                images.save_image(grid, p.outpath_grids, "sonar_grid_search", info=info, extension=opts.grid_format, prompt=p.prompt, seed=p.seed, grid=True, p=p)
+        finally:
+            p.sample = self.sample_saved
+            remove_callbacks_for_function(save_image_hijack)
+        return Processed(p, imgs, p.seed, info)

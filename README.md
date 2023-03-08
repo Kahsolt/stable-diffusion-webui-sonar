@@ -20,7 +20,6 @@ The core idea of Sonar is to search for similar (yet even better!) images in the
 Technically to do this, we hack into the samplers and sampling processing, do some tricks like:
 
   - momentum on latent difference
-  - sample-wise optimzaton on prompt condition and image latent
   - txt2img under hard guidance of another given image (yet another img2img-like in a **shallow fusion** manner...)
 
 to get image latents with higher quality (~perhaps!), and just pray again for good results 🤣
@@ -37,6 +36,8 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 
 ⚪ Features
 
+- 2023/03/08: add grid search (free your hands!!)
+- 2023/01/28: add upcale (issue #3)
 - 2023/01/12: remove gradient-related functionality due to webui code change
 - 2022/11/27: add momentum on `Euler`, add hard ref-image guidance on `Naive`
 - 2022/11/20: add an Euler-like `Naive`, the simplest difference-estimation-based sampler with momentum & gradient
@@ -56,6 +57,8 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 
 ![momentum.png](img/momentum.png)
 
+![grid.jpg](img/grid.jpg)
+
 How momentum works:
 
 - Basically at each sample step, the denoiser will modify the latent image by a `dx`
@@ -68,7 +71,7 @@ How momentum works:
   - by this way, you can anneal your noisy latent image to some other places nearby (works like subseed...)
   - by this way, **you could retain some details which is normally taken as noise and removed by a denoiser** (subseed might not be capable for this)
 
-Parameter tuning reference:
+<del> Parameter tuning reference: </del>
 
 - set `Momentum (current)` to `1`, this will give you an image without momentum mechanism
 - tune `Momentum (current)` and `Momentum (history)` to see what will vary...
@@ -76,6 +79,12 @@ Parameter tuning reference:
   - `Momentum (history)` is weighted-accumulated of all higher-than-1st-order gradients 
   - probably keep `Momentum sign = pos` and `Momentum history init = zero`
   - because other parameters are pure experimental and I could not explain in brief... 🤣
+
+**=> Just run a grid search first:**
+
+- set `Momentum (current) search list` and `Momentum (history) search list`
+- the syntax is `<start>:<stop>:<count>`, will linear interpolate `count` numbers from `start` value to `end` value
+- run Generate!
 
 
 ⚪ ref_img guide
@@ -92,9 +101,11 @@ How hard ref_img guidance works:
   - when the given condition (the digested prompts) mismatches the ref_img very much, they will fight, and the canvas would be again and again overwriten, giving bad final results 🤣
 
 
+![ui](img/ui.png)
+
+
 ### Options
 
-- prompt: (string)
 - base_sampler: (categorical)
   - `Eular a`: `Eular` with ancestral noise sampling
   - `Eular`: `Eular` the original
@@ -114,14 +125,14 @@ How hard ref_img guidance works:
     - `pos`: correct by direction of history momentum, affirming the history
     - `neg`: correct by opposite direction of history momentum, denying the history
     - `rand`: random choose from above at each sampling step
-    - NOTE: option `neg` and `pos_neg` works well only if `momentum_hist` is enough large (`~0.9`)
+    - NOTE: option `neg` works well only if `momentum_hist` is enough large (`~0.9`)
 - ref_*
   - ref_img: (file), reference image file
   - ref_meth: (categorical)
     - `linear`: linear interpolate between current and ref latent
     - `euler`: make an eular step from current to ref latent 
-  - ref_start_step: (float)
-  - ref_stop_step: (float)
+  - ref_start_step: (float, int)
+  - ref_stop_step: (float, int)
     - sampling step range which enables the ref guidance mechanism (kind of scheduling)
     - if > 1, parse as step number; if <= 1, parse as percentage of total steps
 - upscale_*
@@ -132,6 +143,7 @@ How hard ref_img guidance works:
     - if `width==height==0`, upscale by the specified ratio
     - if `width==0 or height==0`, the zero one will be auto calculated to match the non-zero one, keeping the aspect-raio
     - if `width!=0 and height!=0`, upscale while keeping the aspect-raio to cover the target size, then crop the excess if necessary
+
 
 ### Developers
 
