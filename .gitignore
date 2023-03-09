@@ -1,3 +1,6 @@
 # meta
 .vscode/
 __pycache__/
+
+# local config
+config.json

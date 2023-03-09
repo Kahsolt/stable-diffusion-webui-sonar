@@ -36,6 +36,7 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 
 ⚪ Features
 
+- 2023/03/09: switch between two morphs (as AlwaysVisible for working with other scripts, as Script for supporting auto grid search)
 - 2023/03/08: add grid search (free your hands!!)
 - 2023/01/28: add upcale (issue #3)
 - 2023/01/12: remove gradient-related functionality due to webui code change
