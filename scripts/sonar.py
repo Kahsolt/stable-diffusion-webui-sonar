@@ -5,7 +5,7 @@ from contextlib import nullcontext
 from PIL import Image
 from PIL.Image import Image as PILImage
 from pprint import pprint as pp
-from traceback import print_exc
+from traceback import print_exc, format_exc
 import inspect
 
 import gradio as gr
@@ -607,7 +607,7 @@ def parse_gs(seq:str, def_val:float) -> List[float]:
     assert max(start, stop) <= 1.0
     assert min(start, stop) >= 0.0
 
-    if float(step) > 1:
+    if float(step) >= 1:
         step = int(step)
         return np.linspace(start, stop, step).tolist()
     else:
@@ -732,8 +732,10 @@ class Script(scripts.Script):
             try:
                 momentums       = parse_gs(momentum_gs,      momentum)
                 momentum_hists  = parse_gs(momentum_hist_gs, momentum_hist)
-            except Exception as e:
-                return Processed(p, [], p.seed, '>> [Sonar] error parse_gs: ' + str(e))
+            except:
+                e = format_exc()
+                print(e)
+                return Processed(p, [], p.seed, f'>> [Sonar] error parse_gs: {e}')
         else:
             momentums       = [momentum]
             momentum_hists  = [momentum_hist]
