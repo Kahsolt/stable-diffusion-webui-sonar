@@ -592,7 +592,9 @@ def parse_gs(seq:str, def_val:float) -> List[float]:
     if not seq: return [ def_val ]
 
     segs = seq.split(':')
-    if len(segs) == 2:
+    if   len(segs) == 1:
+        return [float(segs[0])]
+    elif len(segs) == 2:
         start, stop = segs
         cnt = 3
     elif len(segs) == 3:
@@ -754,7 +756,8 @@ class Script(scripts.Script):
         state.job_count = n_jobs
         if use_grid_search and n_jobs > 1: print('>> grid search n_jobs:', n_jobs)
         p.seed = get_fixed_seed(p.seed)
-        
+        p.extra_generation_params['Sonar sampler'] = sampler
+
         info = None
         imgs = []
         try:
@@ -764,15 +767,16 @@ class Script(scripts.Script):
                 for mh in momentum_hists:
                     if state.interrupted: interrupted = True; break
 
-                    settings['momentum']      = m
-                    settings['momentum_hist'] = mh
+                    p.extra_generation_params['Sonar momentum']      = settings['momentum']      = m
+                    p.extra_generation_params['Sonar momentum_hist'] = settings['momentum_hist'] = mh
+
                     proc = process_images(p)
                     if info is None: info = proc.info
                     imgs.extend(proc.images)
                 if interrupted: break
 
             if use_grid_search and n_jobs > 1:
-                grid = images.image_grid(imgs, len(momentums))
+                grid = images.image_grid(imgs, rows=len(momentums))
                 grid = images.draw_grid_annotations(
                     grid, 
                     p.width, 
@@ -811,6 +815,10 @@ class Script(scripts.Script):
         settings['ref_max_step']       = int(ref_max_step) if ref_max_step > 1 else round(ref_max_step * p.steps)
         settings['ref_hgf']            = ref_hgf / 10.0
         settings['ref_img']            = ref_img
+
+        p.extra_generation_params['Sonar sampler']       = sampler
+        p.extra_generation_params['Sonar momentum']      = momentum
+        p.extra_generation_params['Sonar momentum_hist'] = momentum_hist
 
         #pp(settings)
 

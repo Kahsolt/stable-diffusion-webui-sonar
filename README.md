@@ -84,7 +84,11 @@ How momentum works:
 **=> Just run a grid search first:**
 
 - set `Momentum (current) search list` and `Momentum (history) search list`
-- the syntax is `<start>:<stop>:<count>`, will linear interpolate `count` numbers from `start` value to `end` value
+- the full syntax is `<start>:<stop>:<count>`, will linear interpolate `count` numbers from `start` value to `end` value
+  - `0.75:0.95:5` => `[0.75, 0.8, 0.85, 0.9, 0.95]`
+  - `0.75:0.95` => `[0.75, 0.85, 0.95]`, by default `count=3`
+  - `0.75` => `[0.75]`, just one constant
+  - when left empty, will read from the Slider value accordingly
 - run Generate!
 
 
