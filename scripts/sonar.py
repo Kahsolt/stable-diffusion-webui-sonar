@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from PIL import Image
 from PIL.Image import Image as PILImage
 from pprint import pprint as pp
+from traceback import print_exc
 import inspect
 
 import gradio as gr
@@ -419,7 +420,6 @@ def create_sampler(sd_model):
     sampler.config = config
     return sampler
 
-
 class KDiffusionSamplerHijack(KDiffusionSampler):
 
     def __init__(self, sd_model, funcname):
@@ -593,19 +593,36 @@ def parse_gs(seq:str, def_val:float) -> List[float]:
 
     segs = seq.split(':')
     if   len(segs) == 1:
-        return [float(segs[0])]
+        start = stop = segs[0]
+        step = 1
     elif len(segs) == 2:
         start, stop = segs
-        cnt = 3
+        step = 3
     elif len(segs) == 3:
-        start, stop, cnt = segs
-    start = float(start)
-    stop = float(stop)
-    cnt = int(cnt)
+        start, stop, step = segs
+    else:
+        raise ValueError('>> malformatted search list: should follow <start>:<stop>:<step>')
+
+    start, stop = float(start), float(stop)
     assert max(start, stop) <= 1.0
     assert min(start, stop) >= 0.0
-    assert cnt > 0
-    return np.linspace(start, stop, cnt).tolist()
+
+    if float(step) > 1:
+        step = int(step)
+        return np.linspace(start, stop, step).tolist()
+    else:
+        step = float(step)
+        assert step != 0.0
+        assert -1.0 < step < 1.0
+        if step > 0.0:
+            assert start < stop
+            ret = [start]
+            while ret[-1] < stop: ret.append(ret[-1] + step)
+        if step < 0.0:
+            assert start > stop
+            ret = [start]
+            while ret[-1] > stop: ret.append(ret[-1] + step)
+        return ret
 
 
 class Script(scripts.Script):
@@ -716,10 +733,20 @@ class Script(scripts.Script):
                 momentums       = parse_gs(momentum_gs,      momentum)
                 momentum_hists  = parse_gs(momentum_hist_gs, momentum_hist)
             except Exception as e:
-                return Processed(p, [], p.seed, str(e))
+                return Processed(p, [], p.seed, '>> [Sonar] error parse_gs: ' + str(e))
         else:
             momentums       = [momentum]
             momentum_hists  = [momentum_hist]
+
+        n_jobs = len(momentums) * len(momentum_hists)
+        if not n_jobs:
+            print('momentums:', momentums)
+            print('momentum_hists:', momentum_hists)
+            return Processed(p, [], p.seed, '>> [Sonar] specified 0 job, are you kidding?')
+        state.job_count = n_jobs
+        if use_grid_search and n_jobs > 1: print('>> [Sonar] grid search n_jobs:', n_jobs)
+        p.seed = get_fixed_seed(p.seed)
+        p.extra_generation_params['Sonar sampler'] = sampler
 
         if ref_img is not None: ref_img = resize_image(1, ref_img, p.width, p.height)
 
@@ -739,7 +766,7 @@ class Script(scripts.Script):
 
         if use_upscale:
             need_upscale, (tgt_w, tgt_h) = get_upscale_resolution(p, upscale_meth, upscale_ratio, upscale_width, upscale_height)
-            if need_upscale: print(f'>> upscale: ({p.width}, {p.height}) => ({tgt_w}, {tgt_h})')
+            if need_upscale: print(f'>> [Sonar] upscaling ({p.width}, {p.height}) => ({tgt_w}, {tgt_h})')
 
         def save_image_hijack(params:ImageSaveParams):
             if use_upscale and need_upscale:
@@ -751,12 +778,6 @@ class Script(scripts.Script):
             p.sample = lambda *args, **kwargs: StableDiffusionProcessingTxt2Img_sample(p, *args, **kwargs)
         elif isinstance(p, StableDiffusionProcessingImg2Img):
             p.sample = lambda *args, **kwargs: StableDiffusionProcessingImg2Img_sample(p, *args, **kwargs)
-
-        n_jobs = len(momentums) * len(momentum_hists)
-        state.job_count = n_jobs
-        if use_grid_search and n_jobs > 1: print('>> grid search n_jobs:', n_jobs)
-        p.seed = get_fixed_seed(p.seed)
-        p.extra_generation_params['Sonar sampler'] = sampler
 
         info = None
         imgs = []
@@ -777,14 +798,20 @@ class Script(scripts.Script):
 
             if use_grid_search and n_jobs > 1:
                 grid = images.image_grid(imgs, rows=len(momentums))
-                grid = images.draw_grid_annotations(
-                    grid, 
-                    p.width, 
-                    p.height, 
-                    ver_texts=[[images.GridAnnotation(f'cur: {round(m, 4)}')]   for m  in momentums], 
-                    hor_texts=[[images.GridAnnotation(f'hist: {round(mh, 4)}')] for mh in momentum_hists], 
-                    margin=4,
-                )
+                try:
+                    grid = images.draw_grid_annotations(
+                        grid, 
+                        p.width, 
+                        p.height, 
+                        ver_texts=[[images.GridAnnotation(f'cur: {round(m, 4)}')]   for m  in momentums], 
+                        hor_texts=[[images.GridAnnotation(f'hist: {round(mh, 4)}')] for mh in momentum_hists], 
+                        margin=4,
+                    )
+                except:
+                    print_exc()
+                    print('>> [Sonar] failed to draw_grid_annotations()')
+                    print('vertically top to down are momentums_cur:', momentums)
+                    print('horizontally left to right are momentum_hists:', momentum_hists)
                 imgs.insert(0, grid)
                 images.save_image(grid, p.outpath_grids, "sonar_grid_search", info=info, extension=opts.grid_format, prompt=p.prompt, seed=p.seed, grid=True, p=p)
         finally:
@@ -824,7 +851,7 @@ class Script(scripts.Script):
 
         if use_upscale:
             need_upscale, (tgt_w, tgt_h) = get_upscale_resolution(p, upscale_meth, upscale_ratio, upscale_width, upscale_height)
-            if need_upscale: print(f'>> upscale: ({p.width}, {p.height}) => ({tgt_w}, {tgt_h})')
+            if need_upscale: print(f'>> [Sonar] upscaling: ({p.width}, {p.height}) => ({tgt_w}, {tgt_h})')
 
         def save_image_hijack(params:ImageSaveParams):
             if use_upscale and need_upscale:
