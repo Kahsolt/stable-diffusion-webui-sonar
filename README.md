@@ -46,6 +46,7 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 
 ⚪ Fixups
 
+- 2023/05/09: updates to sd-webui v1.1.0 (issue #14: `TypeError: CFGDenoiser.forward() missing 's_min_uncond'`)
 - 2023/01/28: keep up with webui's updates (issue #4: `NameError: name 'CFGDenoiser' is not defined`)
 - 2023/01/28: keep up with webui's updates of extra-networks
 - 2023/01/12: keep up with webui's updates (issue #2: `AttributeError: 'Options' object has no attribute 'filter_nsfw'`)

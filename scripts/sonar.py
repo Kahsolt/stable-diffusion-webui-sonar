@@ -434,7 +434,6 @@ class KDiffusionSamplerHijack(KDiffusionSampler):
     def callback_state(self, d):
         # TODO: exploer later
         return super().callback_state(d)
-
     def sample(self, p:StableDiffusionProcessing, x:Tensor, 
                conditioning:MulticondLearnedConditioning, unconditional_conditioning:ScheduledPromptConditioning, 
                steps:int=None, image_conditioning:Tensor=None):
@@ -446,13 +445,19 @@ class KDiffusionSamplerHijack(KDiffusionSampler):
         x = x * sigmas[0]
 
         extra_params_kwargs = self.initialize(p)
-        if 'sigma_min' in inspect.signature(self.func).parameters:
+        parameters = inspect.signature(self.func).parameters
+        
+        if 'sigma_min' in parameters:
             extra_params_kwargs['sigma_min'] = self.model_wrap.sigmas[0].item()
             extra_params_kwargs['sigma_max'] = self.model_wrap.sigmas[-1].item()
-            if 'n' in inspect.signature(self.func).parameters:
+            if 'n' in parameters:
                 extra_params_kwargs['n'] = steps
         else:
             extra_params_kwargs['sigmas'] = sigmas
+
+        if self.funcname == 'sample_dpmpp_sde':
+            noise_sampler = self.create_noise_sampler(x, sigmas, p)
+            extra_params_kwargs['noise_sampler'] = noise_sampler
 
         self.last_latent = x        # [1, 4, 64, 64]
 
@@ -460,7 +465,8 @@ class KDiffusionSamplerHijack(KDiffusionSampler):
             'cond': conditioning,                   # prompt cond
             'image_cond': image_conditioning,       # [1, 5, 1, 1], dummy
             'uncond': unconditional_conditioning,   # negaivte prompt cond
-            'cond_scale': p.cfg_scale               # 7.0
+            'cond_scale': p.cfg_scale,              # 7.0
+            's_min_uncond': p.s_min_uncond,
         }, callback=self.callback_state, **extra_params_kwargs))
 
         return samples
@@ -475,17 +481,23 @@ class KDiffusionSamplerHijack(KDiffusionSampler):
         xi = x + noise * sigma_sched[0]
         
         extra_params_kwargs = self.initialize(p)
-        if 'sigma_min' in inspect.signature(self.func).parameters:
+        parameters = inspect.signature(self.func).parameters
+        
+        if 'sigma_min' in parameters:
             ## last sigma is zero which isn't allowed by DPM Fast & Adaptive so taking value before last
             extra_params_kwargs['sigma_min'] = sigma_sched[-2]
-        if 'sigma_max' in inspect.signature(self.func).parameters:
+        if 'sigma_max' in parameters:
             extra_params_kwargs['sigma_max'] = sigma_sched[0]
-        if 'n' in inspect.signature(self.func).parameters:
+        if 'n' in parameters:
             extra_params_kwargs['n'] = len(sigma_sched) - 1
-        if 'sigma_sched' in inspect.signature(self.func).parameters:
+        if 'sigma_sched' in parameters:
             extra_params_kwargs['sigma_sched'] = sigma_sched
-        if 'sigmas' in inspect.signature(self.func).parameters:
+        if 'sigmas' in parameters:
             extra_params_kwargs['sigmas'] = sigma_sched
+
+        if self.funcname == 'sample_dpmpp_sde':
+            noise_sampler = self.create_noise_sampler(x, sigmas, p)
+            extra_params_kwargs['noise_sampler'] = noise_sampler
 
         self.model_wrap_cfg.init_latent = x
         self.last_latent = x
@@ -494,7 +506,8 @@ class KDiffusionSamplerHijack(KDiffusionSampler):
             'cond': conditioning, 
             'image_cond': image_conditioning, 
             'uncond': unconditional_conditioning, 
-            'cond_scale': p.cfg_scale
+            'cond_scale': p.cfg_scale,
+            's_min_uncond': p.s_min_uncond,
         }, callback=self.callback_state, **extra_params_kwargs))
 
         return samples
