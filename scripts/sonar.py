@@ -15,13 +15,13 @@ from tqdm.auto import trange
 
 from modules import scripts, devices
 from modules.script_callbacks import on_before_image_saved, remove_callbacks_for_function, ImageSaveParams
+from modules.script_callbacks import ExtraNoiseParams, extra_noise_callback
 from modules.shared import state, opts, sd_upscalers
 from modules.sd_samplers_common import setup_img2img_steps, SamplerData
 from modules.sd_samplers_kdiffusion import CFGDenoiser, KDiffusionSampler
 from modules.ui import gr_show
 from modules.prompt_parser import ScheduledPromptConditioning, MulticondLearnedConditioning
 from modules.images import resize_image
-from k_diffusion.sampling import to_d, get_ancestral_step
 from ldm.models.diffusion.ddpm import LatentDiffusion
 
 from typing import List, Tuple, Union, Literal
@@ -125,15 +125,30 @@ def StableDiffusionProcessingTxt2Img_sample(self:StableDiffusionProcessingTxt2Im
     # NOTE: hijack the sampler~
     self.sampler = create_sampler(self.sd_model)
 
-    latent_scale_mode = shared.latent_upscale_modes.get(self.hr_upscaler, None) if self.hr_upscaler is not None else shared.latent_upscale_modes.get(shared.latent_upscale_default_mode, "nearest")
-    if self.enable_hr and latent_scale_mode is None:
-        assert len([x for x in shared.sd_upscalers if x.name == self.hr_upscaler]) > 0, f"could not find upscaler named {self.hr_upscaler}"
-
-    x = create_random_tensors([opt_C, self.height // opt_f, self.width // opt_f], seeds=seeds, subseeds=subseeds, subseed_strength=self.subseed_strength, seed_resize_from_h=self.seed_resize_from_h, seed_resize_from_w=self.seed_resize_from_w, p=self)
+    x = self.rng.next()
     samples = self.sampler.sample(self, x, conditioning, unconditional_conditioning, image_conditioning=self.txt2img_image_conditioning(x))
+    del x
 
     if not self.enable_hr:
         return samples
+
+    if self.latent_scale_mode is None:
+        decoded_samples = torch.stack(decode_latent_batch(self.sd_model, samples, target_device=devices.cpu, check_for_nans=True)).to(dtype=torch.float32)
+    else:
+        decoded_samples = None
+
+    with sd_models.SkipWritingToConfig():
+        sd_models.reload_model_weights(info=self.hr_checkpoint_info)
+
+    devices.torch_gc()
+
+    return StableDiffusionProcessingTxt2Img_sample_hr_pass(self, samples, decoded_samples, seeds, subseeds, subseed_strength, prompts)
+
+def StableDiffusionProcessingTxt2Img_sample_hr_pass(self:StableDiffusionProcessingTxt2Img, samples, decoded_samples, seeds, subseeds, subseed_strength, prompts):
+    if shared.state.interrupted:
+        return samples
+
+    self.is_hr_pass = True
 
     target_width = self.hr_upscale_to_x
     target_height = self.hr_upscale_to_y
@@ -141,20 +156,23 @@ def StableDiffusionProcessingTxt2Img_sample(self:StableDiffusionProcessingTxt2Im
     def save_intermediate(image, index):
         """saves image before applying hires fix, if enabled in options; takes as an argument either an image or batch with latent space images"""
 
-        if not opts.save or self.do_not_save_samples or not opts.save_images_before_highres_fix:
+        if not self.save_samples() or not opts.save_images_before_highres_fix:
             return
 
         if not isinstance(image, Image.Image):
             image = sd_samplers.sample_to_image(image, index, approximation=0)
 
         info = create_infotext(self, self.all_prompts, self.all_seeds, self.all_subseeds, [], iteration=self.iteration, position_in_batch=index)
-        images.save_image(image, self.outpath_samples, "", seeds[index], prompts[index], opts.samples_format, info=info, suffix="-before-highres-fix")
+        images.save_image(image, self.outpath_samples, "", seeds[index], prompts[index], opts.samples_format, info=info, p=self, suffix="-before-highres-fix")
 
-    if latent_scale_mode is not None:
+    # NOTE: hijack the sampler~
+    self.sampler = create_sampler(self.sd_model)
+
+    if self.latent_scale_mode is not None:
         for i in range(samples.shape[0]):
             save_intermediate(samples, i)
 
-        samples = torch.nn.functional.interpolate(samples, size=(target_height // opt_f, target_width // opt_f), mode=latent_scale_mode["mode"], antialias=latent_scale_mode["antialias"])
+        samples = torch.nn.functional.interpolate(samples, size=(target_height // opt_f, target_width // opt_f), mode=self.latent_scale_mode["mode"], antialias=self.latent_scale_mode["antialias"])
 
         # Avoid making the inpainting conditioning unless necessary as
         # this does need some extra compute to decode / encode the image again.
@@ -163,7 +181,6 @@ def StableDiffusionProcessingTxt2Img_sample(self:StableDiffusionProcessingTxt2Im
         else:
             image_conditioning = self.txt2img_image_conditioning(samples)
     else:
-        decoded_samples = decode_first_stage(self.sd_model, samples)
         lowres_samples = torch.clamp((decoded_samples + 1.0) / 2.0, min=0.0, max=1.0)
 
         batch_images = []
@@ -180,34 +197,54 @@ def StableDiffusionProcessingTxt2Img_sample(self:StableDiffusionProcessingTxt2Im
             batch_images.append(image)
 
         decoded_samples = torch.from_numpy(np.array(batch_images))
-        decoded_samples = decoded_samples.to(shared.device)
-        decoded_samples = 2. * decoded_samples - 1.
+        decoded_samples = decoded_samples.to(shared.device, dtype=devices.dtype_vae)
 
-        samples = self.sd_model.get_first_stage_encoding(self.sd_model.encode_first_stage(decoded_samples))
+        if opts.sd_vae_encode_method != 'Full':
+            self.extra_generation_params['VAE Encoder'] = opts.sd_vae_encode_method
+        samples = images_tensor_to_samples(decoded_samples, approximation_indexes.get(opts.sd_vae_encode_method))
 
         image_conditioning = self.img2img_image_conditioning(decoded_samples, samples)
 
     shared.state.nextjob()
 
-    self.sampler = create_sampler(self.sd_model)
-
     samples = samples[:, :, self.truncate_y//2:samples.shape[2]-(self.truncate_y+1)//2, self.truncate_x//2:samples.shape[3]-(self.truncate_x+1)//2]
 
-    noise = create_random_tensors(samples.shape[1:], seeds=seeds, subseeds=subseeds, subseed_strength=subseed_strength, p=self)
+    self.rng = rng.ImageRNG(samples.shape[1:], self.seeds, subseeds=self.subseeds, subseed_strength=self.subseed_strength, seed_resize_from_h=self.seed_resize_from_h, seed_resize_from_w=self.seed_resize_from_w)
+    noise = self.rng.next()
 
     # GC now before running the next img2img to prevent running out of memory
-    x = None
     devices.torch_gc()
 
-    samples = self.sampler.sample_img2img(self, samples, noise, conditioning, unconditional_conditioning, steps=self.hr_second_pass_steps or self.steps, image_conditioning=image_conditioning)
+    if not self.disable_extra_networks:
+        with devices.autocast():
+            extra_networks.activate(self, self.hr_extra_network_data)
 
-    return samples
+    with devices.autocast():
+        self.calculate_hr_conds()
+
+    sd_models.apply_token_merging(self.sd_model, self.get_token_merging_ratio(for_hr=True))
+
+    if self.scripts is not None:
+        self.scripts.before_hr(self)
+
+    samples = self.sampler.sample_img2img(self, samples, noise, self.hr_c, self.hr_uc, steps=self.hr_second_pass_steps or self.steps, image_conditioning=image_conditioning)
+
+    sd_models.apply_token_merging(self.sd_model, self.get_token_merging_ratio())
+
+    self.sampler = None
+    devices.torch_gc()
+
+    decoded_samples = decode_latent_batch(self.sd_model, samples, target_device=devices.cpu, check_for_nans=True)
+
+    self.is_hr_pass = False
+
+    return decoded_samples
 
 def StableDiffusionProcessingImg2Img_sample(self:StableDiffusionProcessingImg2Img, conditioning, unconditional_conditioning, seeds, subseeds, subseed_strength, prompts):
     # NOTE: hijack the sampler~
     self.sampler = create_sampler(self.sd_model)
 
-    x = create_random_tensors([opt_C, self.height // opt_f, self.width // opt_f], seeds=seeds, subseeds=subseeds, subseed_strength=self.subseed_strength, seed_resize_from_h=self.seed_resize_from_h, seed_resize_from_w=self.seed_resize_from_w, p=self)
+    x = self.rng.next()
 
     if self.initial_noise_multiplier != 1.0:
         self.extra_generation_params["Noise multiplier"] = self.initial_noise_multiplier
@@ -227,6 +264,8 @@ def StableDiffusionProcessingImg2Img_sample(self:StableDiffusionProcessingImg2Im
 
 
 # ↓↓↓ the following is modified from 'k_diffusion/sampling.py' ↓↓↓
+
+from k_diffusion.sampling import to_d, get_ancestral_step, default_noise_sampler
 
 @torch.no_grad()
 def sample_naive(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, callback=None, *args):
@@ -343,7 +382,7 @@ def sample_euler_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, cal
     return x
 
 @torch.no_grad()
-def sample_euler_ancestral_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, callback=None, eta=1.):
+def sample_euler_ancestral_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_args={}, callback=None, eta=1., s_noise=1., noise_sampler=None):
     momentum           = settings['momentum']
     momentum_sign      = settings['momentum_sign']
     momentum_hist      = settings['momentum_hist']
@@ -355,6 +394,8 @@ def sample_euler_ancestral_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_ar
     # 记录梯度历史的惯性
     history_d = init_hist_d(momentum_hist_init, x)
 
+    extra_args = {} if extra_args is None else extra_args
+    noise_sampler = default_noise_sampler(x) if noise_sampler is None else noise_sampler
     s_in = x.new_ones([x.shape[0]])     # [B=1]
     n_steps = len(sigmas) - 1
     for i in trange(n_steps):
@@ -382,9 +423,10 @@ def sample_euler_ancestral_ex(model:CFGDenoiser, x:Tensor, sigmas:List, extra_ar
         show_featmap(x, f'x + d x dt (step {i}); sigma_down={sigma_down:.4f}')    # 作画内容逐渐显露
         
         # ancestral scheduling (up)
-        x = x + torch.randn_like(x) * sigma_up
-        show_featmap(x, f'x + randn (step {i}); sigma_up={sigma_up:.4f}')         # 再被压抑下去
-    
+        if sigmas[i + 1] > 0:
+            x = x + noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * sigma_up
+            show_featmap(x, f'x + randn (step {i}); sigma_up={sigma_up:.4f}')         # 再被压抑下去
+
     # x: [1, 4, 64, 64], 采样后是否有语义：有，就是生成图的小图，所以vae decoder做的事基本就是超分
     show_featmap(x, 'after sample')
 
@@ -433,6 +475,7 @@ class KDiffusionSamplerHijack(KDiffusionSampler):
     def callback_state(self, d):
         # TODO: exploer later
         return super().callback_state(d)
+
     def sample(self, p:StableDiffusionProcessing, x:Tensor, 
                conditioning:MulticondLearnedConditioning, unconditional_conditioning:ScheduledPromptConditioning, 
                steps:int=None, image_conditioning:Tensor=None):
@@ -441,32 +484,45 @@ class KDiffusionSamplerHijack(KDiffusionSampler):
         # sigmas: [16=steps+1], sigma[0]=14.6116 && sigma[-1]=0.0 都是常量，中间是递减的插值(指数衰减？)
         sigmas = self.get_sigmas(p, steps)
         # x: [B=1, C=4, H=64, W=64]
-        x = x * sigmas[0]
+        if opts.sgm_noise_multiplier:
+            p.extra_generation_params["SGM noise multiplier"] = True
+            x = x * torch.sqrt(1.0 + sigmas[0] ** 2.0)
+        else:
+            x = x * sigmas[0]
 
         extra_params_kwargs = self.initialize(p)
         parameters = inspect.signature(self.func).parameters
         
+        if 'n' in parameters:
+            extra_params_kwargs['n'] = steps
+
         if 'sigma_min' in parameters:
             extra_params_kwargs['sigma_min'] = self.model_wrap.sigmas[0].item()
             extra_params_kwargs['sigma_max'] = self.model_wrap.sigmas[-1].item()
-            if 'n' in parameters:
-                extra_params_kwargs['n'] = steps
-        else:
+
+        if 'sigmas' in parameters:
             extra_params_kwargs['sigmas'] = sigmas
 
-        if self.funcname == 'sample_dpmpp_sde':
+        if self.config.options.get('brownian_noise', False):
             noise_sampler = self.create_noise_sampler(x, sigmas, p)
             extra_params_kwargs['noise_sampler'] = noise_sampler
 
-        self.last_latent = x        # [1, 4, 64, 64]
+        if self.config.options.get('solver_type', None) == 'heun':
+            extra_params_kwargs['solver_type'] = 'heun'
 
-        samples = self.launch_sampling(steps, lambda: self.func(self.model_wrap_cfg, x, extra_args={
-            'cond': conditioning,                   # prompt cond
-            'image_cond': image_conditioning,       # [1, 5, 1, 1], dummy
-            'uncond': unconditional_conditioning,   # negaivte prompt cond
-            'cond_scale': p.cfg_scale,              # 7.0
-            's_min_uncond': p.s_min_uncond,
-        }, callback=self.callback_state, **extra_params_kwargs))
+        self.last_latent = x    # [1, 4, 64, 64]
+        self.sampler_extra_args = {
+            'cond': conditioning,
+            'image_cond': image_conditioning,
+            'uncond': unconditional_conditioning,
+            'cond_scale': p.cfg_scale,
+            's_min_uncond': self.s_min_uncond
+        }
+
+        samples = self.launch_sampling(steps, lambda: self.func(self.model_wrap_cfg, x, extra_args=self.sampler_extra_args, callback=self.callback_state, **extra_params_kwargs))
+
+        if self.model_wrap_cfg.padded_cond_uncond:
+            p.extra_generation_params["Pad conds"] = True
 
         return samples
 
@@ -479,9 +535,16 @@ class KDiffusionSamplerHijack(KDiffusionSampler):
         sigma_sched = sigmas[steps - t_enc - 1:]
         xi = x + noise * sigma_sched[0]
         
+        if opts.img2img_extra_noise > 0:
+            p.extra_generation_params["Extra noise"] = opts.img2img_extra_noise
+            extra_noise_params = ExtraNoiseParams(noise, x, xi)
+            extra_noise_callback(extra_noise_params)
+            noise = extra_noise_params.noise
+            xi += noise * opts.img2img_extra_noise
+
         extra_params_kwargs = self.initialize(p)
         parameters = inspect.signature(self.func).parameters
-        
+
         if 'sigma_min' in parameters:
             ## last sigma is zero which isn't allowed by DPM Fast & Adaptive so taking value before last
             extra_params_kwargs['sigma_min'] = sigma_sched[-2]
@@ -494,20 +557,27 @@ class KDiffusionSamplerHijack(KDiffusionSampler):
         if 'sigmas' in parameters:
             extra_params_kwargs['sigmas'] = sigma_sched
 
-        if self.funcname == 'sample_dpmpp_sde':
+        if self.config.options.get('brownian_noise', False):
             noise_sampler = self.create_noise_sampler(x, sigmas, p)
             extra_params_kwargs['noise_sampler'] = noise_sampler
 
+        if self.config.options.get('solver_type', None) == 'heun':
+            extra_params_kwargs['solver_type'] = 'heun'
+
         self.model_wrap_cfg.init_latent = x
         self.last_latent = x
-
-        samples = self.launch_sampling(t_enc + 1, lambda: self.func(self.model_wrap_cfg, xi, extra_args={
-            'cond': conditioning, 
-            'image_cond': image_conditioning, 
-            'uncond': unconditional_conditioning, 
+        self.sampler_extra_args = {
+            'cond': conditioning,
+            'image_cond': image_conditioning,
+            'uncond': unconditional_conditioning,
             'cond_scale': p.cfg_scale,
-            's_min_uncond': p.s_min_uncond,
-        }, callback=self.callback_state, **extra_params_kwargs))
+            's_min_uncond': self.s_min_uncond
+        }
+
+        samples = self.launch_sampling(t_enc + 1, lambda: self.func(self.model_wrap_cfg, xi, extra_args=self.sampler_extra_args, callback=self.callback_state, **extra_params_kwargs))
+
+        if self.model_wrap_cfg.padded_cond_uncond:
+            p.extra_generation_params["Pad conds"] = True
 
         return samples
 
@@ -654,7 +724,7 @@ class Script(scripts.Script):
             if not IS_SCRIPTS:
                 is_enable = gr.Checkbox(label='Enable', value=lambda: DEFAULT_ENABLE)
 
-            with gr.Row(variant='compact').style(equal_height=True):
+            with gr.Row(variant='compact', equal_height=True):
                 sampler = gr.Radio(label='Base Sampler', value=lambda: DEFAULT_SAMPLER, choices=CHOICE_SAMPLER)
                 use_upscale = gr.Checkbox(label='Upscaling', value=lambda: DEFAULT_UPSCALE)
 

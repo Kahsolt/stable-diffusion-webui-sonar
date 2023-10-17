@@ -30,12 +30,9 @@ to get image latents with higher quality (~perhaps!), and just pray again for go
 
 ### Change Log
 
-⚪ Compatibility Warning
-
-- 2023/01/04: webui's recent commit [#bd68e35de3b7cf7547ed97d8bdf60147402133cc](https://github.com/AUTOMATIC1111/stable-diffusion-webui/commit/bd68e35de3b7cf7547ed97d8bdf60147402133cc) saves memory use in forward caculation, but totally ruins backward gradient caculation via `torch.autograd.grad()` which this script heavily relies on. This change is so far not pluggable but forcely applied, so we're regrettable to say, sonar's `grad` optimization part will be broken henceforth. (issue #1 cannot be fixed)
-
 ⚪ Features
 
+- 2023/10/17: work with SDXL models
 - 2023/03/09: switch between two morphs (as AlwaysVisible for working with other scripts, as Script for supporting auto grid search)
 - 2023/03/08: add grid search (free your hands!!)
 - 2023/01/28: add upcale (issue #3)
