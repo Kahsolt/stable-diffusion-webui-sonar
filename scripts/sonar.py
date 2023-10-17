@@ -28,8 +28,7 @@ from typing import List, Tuple, Union, Literal
 from torch import Tensor
 
 # local config
-SD_WEBUI_PATH = Path.cwd()
-SONAR_PATH = SD_WEBUI_PATH / 'extensions' / 'stable-diffusion-webui-sonar'
+SONAR_PATH = Path(scripts.basedir())
 CONFIG_FILE = SONAR_PATH / 'config.json'
 
 def load_cfg():
